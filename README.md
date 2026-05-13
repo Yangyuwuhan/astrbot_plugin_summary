@@ -35,7 +35,7 @@
 - `source_max_size` / `source_max_minute`：下载资源大小与时长限制
 - `download_timeout` / `download_retry_times` / `common_timeout`：下载与请求超时控制
 - `proxy`：全局代理地址
-- `parsers_template`：各平台解析器开关与参数
+- `parsers_template`：各平台解析器开关与参数，具体请参考[astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
 
 ## 缓存策略
 
@@ -46,9 +46,10 @@
 
 缓存数据储存在 `data/plugin_data/astrbot_plugin_summary/cache/`
 
-## 注意：
+## 注意
 
 - 环境中需存在 `ffmpeg`
+- 支持的 URL 请参考 [astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
 - 可在`data/plugins/astrbot_plugin_summary/core/prompts/`中添加`.txt`文件来自定义输出模板。注意重载插件以加载新模板。
 - 本插件的工作依赖于音频转文字，并非直接浏览视频
 - 本插件采用 **vibe coding**，作者已对其功能进行严格审查，但不保证插件稳定性
