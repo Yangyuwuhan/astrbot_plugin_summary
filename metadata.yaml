@@ -1,0 +1,6 @@
+display_name: 视频总结器
+name: astrbot_plugin_summary
+desc: 通过 url 下载视频并生成详细的 AI 总结。
+version: v1.0.0
+author: Yangyuwuhan
+repo: https://github.com/Yangyuwuhan/astrbot_plugin_summary
