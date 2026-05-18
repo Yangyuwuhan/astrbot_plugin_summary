@@ -4,6 +4,7 @@ import time
 from typing import Optional, List
 
 import requests
+from requests import RequestException
 
 from .transcriber_model import TranscriptSegment, TranscriptResult
 
@@ -20,8 +21,8 @@ class BcutTranscriber:
     """必剪 语音识别接口（免费在线转写）"""
 
     headers = {
-        'User-Agent': 'Bilibili/1.0.0 (https://www.bilibili.com)',
-        'Content-Type': 'application/json'
+        "User-Agent": "Bilibili/1.0.0 (https://www.bilibili.com)",
+        "Content-Type": "application/json",
     }
 
     def __init__(self):
@@ -37,7 +38,7 @@ class BcutTranscriber:
         self.__download_url: Optional[str] = None
 
     def _load_file(self, file_path: str) -> bytes:
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             return f.read()
 
     def _upload(self, file_path: str) -> None:
@@ -46,13 +47,15 @@ class BcutTranscriber:
         if not file_binary:
             raise ValueError("无法读取文件数据")
 
-        payload = json.dumps({
-            "type": 2,
-            "name": "audio.mp3",
-            "size": len(file_binary),
-            "ResourceFileType": "mp3",
-            "model_id": "8",
-        })
+        payload = json.dumps(
+            {
+                "type": 2,
+                "name": "audio.mp3",
+                "size": len(file_binary),
+                "ResourceFileType": "mp3",
+                "model_id": "8",
+            }
+        )
 
         resp = self.session.post(API_REQ_UPLOAD, data=payload, headers=self.headers)
         resp.raise_for_status()
@@ -78,7 +81,7 @@ class BcutTranscriber:
             resp = self.session.put(
                 self.__upload_urls[clip],
                 data=file_binary[start_range:end_range],
-                headers={'Content-Type': 'application/octet-stream'}
+                headers={"Content-Type": "application/octet-stream"},
             )
             resp.raise_for_status()
             etag = resp.headers.get("Etag", "").strip('"')
@@ -86,13 +89,15 @@ class BcutTranscriber:
 
     def __commit_upload(self) -> None:
         """提交上传"""
-        data = json.dumps({
-            "InBossKey": self.__in_boss_key,
-            "ResourceId": self.__resource_id,
-            "Etags": ",".join(self.__etags),
-            "UploadId": self.__upload_id,
-            "model_id": "8",
-        })
+        data = json.dumps(
+            {
+                "InBossKey": self.__in_boss_key,
+                "ResourceId": self.__resource_id,
+                "Etags": ",".join(self.__etags),
+                "UploadId": self.__upload_id,
+                "model_id": "8",
+            }
+        )
         resp = self.session.post(API_COMMIT_UPLOAD, data=data, headers=self.headers)
         resp.raise_for_status()
         resp = resp.json()
@@ -107,7 +112,7 @@ class BcutTranscriber:
         resp = self.session.post(
             API_CREATE_TASK,
             json={"resource": self.__download_url, "model_id": "8"},
-            headers=self.headers
+            headers=self.headers,
         )
         resp.raise_for_status()
         resp = resp.json()
@@ -123,7 +128,7 @@ class BcutTranscriber:
         resp = self.session.get(
             API_QUERY_RESULT,
             params={"model_id": 8, "task_id": self.task_id},
-            headers=self.headers
+            headers=self.headers,
         )
         resp.raise_for_status()
         resp = resp.json()
@@ -158,7 +163,9 @@ class BcutTranscriber:
                 time.sleep(1)
 
             if not task_resp or task_resp["state"] != 4:
-                raise Exception(f"转写超时，状态: {task_resp.get('state') if task_resp else 'Unknown'}")
+                raise Exception(
+                    f"转写超时，状态: {task_resp.get('state') if task_resp else 'Unknown'}"
+                )
 
             result_json = json.loads(task_resp["result"])
 
@@ -171,17 +178,15 @@ class BcutTranscriber:
                 end_time = float(u.get("end_time", 0)) / 1000.0
 
                 full_text += text + " "
-                segments.append(TranscriptSegment(
-                    start=start_time,
-                    end=end_time,
-                    text=text
-                ))
+                segments.append(
+                    TranscriptSegment(start=start_time, end=end_time, text=text)
+                )
 
             return TranscriptResult(
                 language=result_json.get("language", "zh"),
                 full_text=full_text.strip(),
                 segments=segments,
-                raw=result_json
+                raw=result_json,
             )
 
         except Exception as e:

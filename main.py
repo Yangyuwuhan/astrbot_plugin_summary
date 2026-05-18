@@ -1,12 +1,10 @@
-import os
 import re
 import time
 import asyncio
 import uuid
-import datetime
 import json
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List, Any
+from typing import Optional, Tuple, List, Any
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -15,7 +13,7 @@ from astrbot.core import AstrBotConfig
 
 # 引用 复制过来的 bcut 和模型
 from .core.transcriber.bcut import BcutTranscriber
-from .core.transcriber.transcriber_model import TranscriptResult, TranscriptSegment
+from .core.transcriber.transcriber_model import TranscriptSegment
 
 # 引用 parser 项目组件
 from .core.parser.download import Downloader
@@ -36,25 +34,31 @@ class VideoSummaryPlugin(Star):
         self.downloader = Downloader(self.cfg)
         self.transcriber = BcutTranscriber()
         self._debug = bool(getattr(self.cfg, "debug_mode", False))
-        self._temp_dir = self.cfg.temp_dir
-        self._parser_map, self._parser_patterns = self._build_parser_index()
+
+        # 确保 temp_dir 与 cache_dir 为 Path 且存在
+        self._temp_dir = Path(getattr(self.cfg, "temp_dir", Path.cwd() / "tmp"))
+        self._cache_dir = Path(getattr(self.cfg, "cache_dir", self._temp_dir / "cache"))
+        try:
+            self._temp_dir.mkdir(parents=True, exist_ok=True)
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"无法创建临时/缓存目录: {e}")
+
+        self._parser_patterns = self._build_parser_index()
 
     def _build_parser_index(self):
         """构建提取器索引"""
-        parser_map = {}
         patterns = []
         for parser_cls in BaseParser.get_all_subclass():
             parser_inst = parser_cls(self.cfg, self.downloader)
-            parser_map[parser_inst.platform.name] = parser_inst
             # 聚合所有的配置里的白名单正则表达式
             # 这里简单直接聚合所有 parser 的 _key_patterns
             for keyword, pattern in getattr(parser_inst, "_key_patterns", []):
                 patterns.append((keyword, pattern, parser_inst))
-        return parser_map, patterns
+        return patterns
 
     def _get_json_cache_path(self, url_hash: str) -> Path:
-        cache_dir = self.cfg.cache_dir
-        return cache_dir / f"{url_hash}.json"
+        return self._cache_dir / f"{url_hash}.json"
 
     def _read_json_cache(self, url_hash: str) -> dict:
         cache_file = self._get_json_cache_path(url_hash)
@@ -66,7 +70,7 @@ class VideoSummaryPlugin(Star):
                 return {}
         return {}
 
-    def _write_json_cache(self, url_hash: str, key: str, value: Any, url: str = None):
+    def _write_json_cache(self, url_hash: str, key: str, value: Any, url: Optional[str] = None):
         data = self._read_json_cache(url_hash)
         if url:
             data["url"] = url
@@ -174,7 +178,7 @@ class VideoSummaryPlugin(Star):
             cached_sum = cache_dict.get("summary")
             if cached_sum:
                 if getattr(self.cfg, "show_token_usage", False):
-                    cached_sum += f"\n━━━━━━━━━━━━━━\n输入: 0 tokens\n输出: 0 tokens\n耗时: 0.00 s"
+                    cached_sum += "\n━━━━━━━━━━━━━━\n输入: 0 tokens\n输出: 0 tokens\n耗时: 0.00 s"
                 yield event.plain_result(f"📌 视频总结（命中缓存）\n\n{cached_sum}")
                 return
 
@@ -353,7 +357,7 @@ class VideoSummaryPlugin(Star):
             if getattr(self.cfg, "show_token_usage", False):
                 input_tokens = 0
                 output_tokens = 0
-                if hasattr(response, "usage") and response.usage:
+                if not isinstance(response, str) and hasattr(response, "usage") and response.usage:
                     usage = response.usage
                     input_tokens = getattr(usage, "input_other", 0) + getattr(
                         usage, "input_cached", 0
