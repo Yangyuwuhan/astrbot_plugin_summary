@@ -3,6 +3,7 @@ import time
 import asyncio
 import uuid
 import json
+import os
 from pathlib import Path
 from typing import Optional, Tuple, List, Any
 
@@ -70,7 +71,9 @@ class VideoSummaryPlugin(Star):
                 return {}
         return {}
 
-    def _write_json_cache(self, url_hash: str, key: str, value: Any, url: Optional[str] = None):
+    def _write_json_cache(
+        self, url_hash: str, key: str, value: Any, url: Optional[str] = None
+    ):
         data = self._read_json_cache(url_hash)
         if url:
             data["url"] = url
@@ -178,7 +181,9 @@ class VideoSummaryPlugin(Star):
             cached_sum = cache_dict.get("summary")
             if cached_sum:
                 if getattr(self.cfg, "show_token_usage", False):
-                    cached_sum += "\n━━━━━━━━━━━━━━\n输入: 0 tokens\n输出: 0 tokens\n耗时: 0.00 s"
+                    cached_sum += (
+                        "\n━━━━━━━━━━━━━━\n输入: 0 tokens\n输出: 0 tokens\n耗时: 0.00 s"
+                    )
                 yield event.plain_result(f"📌 视频总结（命中缓存）\n\n{cached_sum}")
                 return
 
@@ -357,7 +362,11 @@ class VideoSummaryPlugin(Star):
             if getattr(self.cfg, "show_token_usage", False):
                 input_tokens = 0
                 output_tokens = 0
-                if not isinstance(response, str) and hasattr(response, "usage") and response.usage:
+                if (
+                    not isinstance(response, str)
+                    and hasattr(response, "usage")
+                    and response.usage
+                ):
                     usage = response.usage
                     input_tokens = getattr(usage, "input_other", 0) + getattr(
                         usage, "input_cached", 0
