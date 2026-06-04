@@ -47,20 +47,14 @@ class YouTubeParser(BaseParser):
 
         contents = []
         if video_info.duration <= self.cfg.max_duration:
-            video = self.downloader.ytdlp_download_video(
+            audio_task = self.downloader.ytdlp_download_audio(
                 url,
                 cookiefile=self.cookiejar.cookie_file,
                 headers=self.headers,
                 proxy=self.proxy,
-                format="bv*[height<=720]+ba/b[height<=720]",
-                node=True,
             )
             contents.append(
-                self.create_video_content(
-                    video,
-                    video_info.thumbnail,
-                    video_info.duration,
-                )
+                self.create_audio_content(audio_task, duration=video_info.duration)
             )
         else:
             contents.extend(self.create_image_contents([video_info.thumbnail]))

@@ -165,9 +165,9 @@ class BilibiliParser(BaseParser):
         url = f"https://bilibili.com/{video_info.bvid}"
         url += f"?p={page_info.index + 1}" if page_info.index > 0 else ""
 
-        # 视频下载 task
-        async def download_video():
-            output_path = self.cfg.temp_dir / f"{video_info.bvid}-{page_num}.mp4"
+        # 音频下载 task
+        async def download_audio():
+            output_path = self.cfg.temp_dir / f"{video_info.bvid}-{page_num}_audio.m4a"
             if output_path.exists():
                 return output_path
             v_url, a_url = await self.extract_download_urls(
@@ -175,27 +175,19 @@ class BilibiliParser(BaseParser):
             )
             if page_info.duration > self.cfg.max_duration:
                 raise DurationLimitException
-            if a_url is not None:
-                return await self.downloader.download_av_and_merge(
-                    v_url,
-                    a_url,
-                    output_path=output_path,
-                    headers=self.headers,
-                    proxy=self.proxy,
-                )
-            else:
-                return await self.downloader.streamd(
-                    v_url,
-                    file_name=output_path.name,
-                    headers=self.headers,
-                    proxy=self.proxy,
-                )
 
-        video_task = asyncio.create_task(download_video())
-        video_content = self.create_video_content(
-            video_task,
-            page_info.cover,
-            page_info.duration,
+            target_url = a_url if a_url is not None else v_url
+            return await self.downloader.streamd(
+                target_url,
+                file_name=output_path.name,
+                headers=self.headers,
+                proxy=self.proxy,
+            )
+
+        audio_task = asyncio.create_task(download_audio())
+        audio_content = self.create_audio_content(
+            audio_task,
+            duration=page_info.duration,
         )
 
         return self.result(
@@ -204,7 +196,7 @@ class BilibiliParser(BaseParser):
             timestamp=page_info.timestamp,
             text=text,
             author=author,
-            contents=[video_content],
+            contents=[audio_content],
             extra={"info": ai_summary},
         )
 
@@ -431,6 +423,3 @@ class BilibiliParser(BaseParser):
             return video_stream.url, None
         logger.debug(f"音频流质量: {audio_stream.audio_quality.name}")
         return video_stream.url, audio_stream.url
-
-
-

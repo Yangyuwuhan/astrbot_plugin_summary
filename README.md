@@ -59,7 +59,3 @@
 - 本项目使用了 [astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 的部分代码实现资源下载
 - 本项目受 [astrbot_plugin_biliVideo](https://github.com/storyAura/astrbot_plugin_biliVideo) 启发，使用必剪的接口实现视频字幕提取
 - 本项目使用了 [astrbot_plugin_markdown_killer](https://github.com/AlanBacker/astrbot_plugin_markdown_killer) 的主要逻辑实现对 markdown格式 的严格剔除
-
-## 许可证
-
-MIT LIENCE

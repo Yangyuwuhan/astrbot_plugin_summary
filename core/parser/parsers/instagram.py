@@ -14,7 +14,7 @@ from astrbot.api import logger
 
 from ..config import PluginConfig
 from ..cookie import CookieJar
-from ..data import ImageContent, Platform, VideoContent
+from ..data import AudioContent, ImageContent, Platform
 from ..download import Downloader
 from ..exception import ParseException
 from .base import BaseParser, handle
@@ -358,17 +358,17 @@ class InstagramParser(BaseParser):
                     contents.append(ImageContent(image_task))
                 return self.result(contents=contents, url=final_url)
             try:
-                video_task = await self.downloader.ytdlp_download_video(
+                audio_task = await self.downloader.ytdlp_download_audio(
                     final_url,
                     cookiefile=self.cookiejar.cookie_file,
                     headers=self.headers,
                     proxy=self.proxy,
-                    format="best[height<=720]/bestvideo[height<=720]+bestaudio/best",
+                    format="bestaudio/best",
                 )
-                contents.append(VideoContent(video_task, None, 0))
+                contents.append(AudioContent(audio_task, 0))
                 return self.result(contents=contents, url=final_url)
             except ParseException as exc:
-                raise ParseException("未找到可下载的视频") from exc
+                raise ParseException("未找到可下载的音频") from exc
         entries = self._iter_entries(info)
         single_entry = len(entries) == 1
 
@@ -382,59 +382,33 @@ class InstagramParser(BaseParser):
                 if video_fmt:
                     video_url = video_fmt.get("url")
             duration = float(entry.get("duration") or 0)
-            if not video_url:
-                continue
-            if video_url:
-                cover_task = None
-                if audio_url:
-                    output_path = self._merged_output_path(video_url, audio_url)
-                    if output_path.exists():
-                        video_task = output_path
-                    else:
-                        video_task = self.downloader.download_av_and_merge(
-                            video_url,
-                            audio_url,
-                            output_path=output_path,
-                            headers=self.headers,
-                            proxy=self.proxy,
-                        )
-                    contents.append(VideoContent(video_task, cover_task, duration))
-                else:
-                    v_url, a_url = (None, None)
-                    if single_entry:
-                        v_url, a_url = self._select_media_urls(info)
-                    if a_url and v_url:
-                        output_path = self._merged_output_path(v_url, a_url)
-                        if output_path.exists():
-                            video_task = output_path
-                        else:
-                            video_task = self.downloader.download_av_and_merge(
-                                v_url,
-                                a_url,
-                                output_path=output_path,
-                                headers=self.headers,
-                                proxy=self.proxy,
-                            )
-                        contents.append(VideoContent(video_task, cover_task, duration))
-                        if meta_entry is None:
-                            meta_entry = entry
-                        continue
 
-                    fallback_video_tried = True
-                    try:
-                        video_task = await self.downloader.ytdlp_download_video(
-                            final_url,
-                            cookiefile=self.cookiejar.cookie_file,
-                            headers=self.headers,
-                            proxy=self.proxy,
-                            format="best[height<=720]/bestvideo[height<=720]+bestaudio/best",
-                        )
-                        contents.append(VideoContent(video_task, cover_task, duration))
-                        if meta_entry is None:
-                            meta_entry = entry
-                        continue
-                    except ParseException:
-                        pass
+            if not video_url and not audio_url:
+                continue
+
+            if audio_url:
+                # 如果能拆分出纯音频，则直接利用 aiohttp 快速下载此 url 并作为音频
+                audio_task = self.downloader.download_audio(
+                    audio_url, headers=self.headers, proxy=self.proxy
+                )
+                contents.append(AudioContent(audio_task, duration))
+            elif video_url:
+                # 如果只拿到了视频连接（或合并链接），那么利用 yt-dlp 来专门提取音频
+                fallback_video_tried = True
+                try:
+                    audio_task = await self.downloader.ytdlp_download_audio(
+                        final_url,
+                        cookiefile=self.cookiejar.cookie_file,
+                        headers=self.headers,
+                        proxy=self.proxy,
+                        format="bestaudio/best",
+                    )
+                    contents.append(AudioContent(audio_task, duration))
+                    if meta_entry is None:
+                        meta_entry = entry
+                    continue
+                except ParseException:
+                    pass
             if meta_entry is None:
                 meta_entry = entry
 
@@ -445,14 +419,15 @@ class InstagramParser(BaseParser):
                 try:
                     duration = float(meta.get("duration") or 0)
                     if isinstance(fallback_url, str) and fallback_url:
-                        video_task = await self.downloader.ytdlp_download_video(
+                        audio_task = await self.downloader.ytdlp_download_audio(
                             fallback_url,
                             cookiefile=self.cookiejar.cookie_file,
                             headers=self.headers,
                             proxy=self.proxy,
-                            format="best[height<=720]/bestvideo[height<=720]+bestaudio/best",
+                            format="bestaudio/best",
                         )
-                        contents.append(VideoContent(video_task, None, duration))
+                        contents.append(AudioContent(audio_task, duration))
+                        return self.result(contents=contents, url=final_url)
                 except ParseException:
                     pass
             if not contents and not is_video_url:

@@ -11,8 +11,9 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
+from astrbot.api.message_components import Reply, Plain
 
-# 引用 复制过来的 bcut 和模型
+# 引用 bcut 和模型
 from .core.transcriber.bcut import BcutTranscriber
 from .core.transcriber.transcriber_model import TranscriptSegment
 
@@ -22,12 +23,6 @@ from .core.parser.config import PluginConfig
 from .core.parser.parsers.base import BaseParser
 
 
-@register(
-    "astrbot_plugin_summary",
-    "YOUR_NAME",
-    "支持视频内容解析与总结，针对任意平台提供专业总结分析。",
-    "1.0",
-)
 class VideoSummaryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -57,6 +52,22 @@ class VideoSummaryPlugin(Star):
             for keyword, pattern in getattr(parser_inst, "_key_patterns", []):
                 patterns.append((keyword, pattern, parser_inst))
         return patterns
+
+    def _extract_first_http(self, text: str) -> Optional[str]:
+        """从文本中提取第一个以 http/https 开头的链接，去掉末尾常见标点。
+
+        返回第一个匹配到的链接字符串或 None。
+        """
+        if not text:
+            return None
+        # 匹配以 http 或 https 开头直到遇到空白字符的部分
+        m = re.search(r"https?://\S+", text)
+        if not m:
+            return None
+        url = m.group(0)
+        # 去除末尾可能跟着的中文/英文标点或括号
+        url = url.rstrip("\u3002\uff0c\uff1f\uff01.,;:!?)]}\u3001")
+        return url
 
     def _get_json_cache_path(self, url_hash: str) -> Path:
         return self._cache_dir / f"{url_hash}.json"
@@ -146,13 +157,13 @@ class VideoSummaryPlugin(Star):
         return out_mp3, targets
 
     @filter.command("总结")
-    async def summarize_video(self, event: AstrMessageEvent, url: str):
+    async def summarize_video(self, event: AstrMessageEvent, url: str = ""):
         """总结任意视频链接: /总结 <URL>"""
         async for result in self._summarize_video_impl(event, url, force_refresh=False):
             yield result
 
     @filter.command("强制总结")
-    async def force_summarize_video(self, event: AstrMessageEvent, url: str):
+    async def force_summarize_video(self, event: AstrMessageEvent, url: str = ""):
         """强制重新总结任意视频链接: /强制总结 <URL>"""
         async for result in self._summarize_video_impl(event, url, force_refresh=True):
             yield result
@@ -161,8 +172,32 @@ class VideoSummaryPlugin(Star):
         self, event: AstrMessageEvent, url: str, force_refresh: bool = False
     ):
         """统一总结主流程。force_refresh=True 时优先复用本地字幕缓存并强制重跑 LLM。"""
-        if not url.startswith("http"):
-            yield event.plain_result("❌ 请输入有效的URL链接")
+        # 为了支持用户在 URL 前后带描述文本（例如："/总结 B站视频<url>"），
+        # 先尝试从完整的消息文本中提取第一个 http 链接作为最终的 url。
+        raw_msg = getattr(event, "message_str", None) or ""
+        first = self._extract_first_http(raw_msg)
+        if first:
+            url = first
+        else:
+            # 如果从当条消息中没有提取到链接，尝试从引用的消息中提取
+            message_chain = event.get_messages()
+            reply_seg = next(
+                (seg for seg in message_chain if isinstance(seg, Reply)), None
+            )
+            if reply_seg and reply_seg.chain:
+                reply_text = ""
+                for seg in reply_seg.chain:
+                    if isinstance(seg, Plain):
+                        reply_text += seg.text
+                if reply_text:
+                    first_reply_url = self._extract_first_http(reply_text)
+                    if first_reply_url:
+                        url = first_reply_url
+
+        if not isinstance(url, str) or not url.startswith("http"):
+            yield event.plain_result(
+                "❌ 请输入有效的URL链接，或者引用一条包含链接的消息"
+            )
             return
 
         parser_inst, keyword, searched = await self._resolve_url(url)
