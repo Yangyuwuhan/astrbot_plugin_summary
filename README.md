@@ -6,10 +6,11 @@
 
 ## 功能特性
 
-- 支持多平台 URL 解析
+- 支持多平台 URL 解析，支持直链媒体作为回退兜底
 - 借助必剪接口实现音频转文字
 - 本地硬盘缓存，重复 URL 直接从本地获取字幕和总结内容，降低成本
 - 支持强制总结，复用本地字幕并重新调用 LLM，覆盖旧总结，防止偶然错误
+- 注册 LLM 工具，对话中自动识别视频/音频链接并提取内容，无需手动指令
 
 ## 工作流程
 
@@ -35,7 +36,27 @@
 - `source_max_size` / `source_max_minute`：下载资源大小与时长限制
 - `download_timeout` / `download_retry_times` / `common_timeout`：下载与请求超时控制
 - `proxy`：全局代理地址
+- `enable_media_summary_tool`：是否向 LLM 注册媒体总结工具
+- `enable_media_subtitle_tool`：是否向 LLM 注册字幕提取工具
 - `parsers_template`：各平台解析器开关与参数，具体请参考[astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
+
+## LLM 工具
+
+插件注册了两个 LLM 工具，可在对话中由 LLM 自动判断并调用，无需用户手动输入指令：
+
+### `summary_extract_media_summary`（媒体总结工具）
+
+当对话中出现视频/音频链接时，LLM 可调用此工具获取内容的 AI 总结。
+
+- **流程**：解析链接 → 下载媒体 → 提取音频 → 必剪转写 → 调用插件配置的 LLM 生成总结 → 返回精炼摘要
+- **适用场景**：用户分享视频链接并询问"这个视频讲了什么"时，LLM 自动提取并总结
+
+### `summary_extract_media_subtitle`（字幕提取工具）
+
+提取视频/音频链接中的原始字幕文本（含时间戳），不进行 AI 总结。
+
+- **流程**：解析链接 → 下载媒体 → 提取音频 → 必剪转写 → 返回带时间戳的字幕
+- **适用场景**：需要逐字分析原始语音内容，或对字幕进行二次处理
 
 ## 缓存策略
 
@@ -43,6 +64,7 @@
 
 - `/总结 url`：若命中 URL 对应总结缓存，直接返回缓存总结
 - `/强制总结 url`：若命中本地字幕缓存，跳过下载与转写，直接交给 LLM 重新总结并覆盖旧缓存总结
+- LLM 工具与 `/总结` 命令共用同一套本地缓存。
 
 缓存数据储存在 `data/plugin_data/astrbot_plugin_summary/cache/`
 

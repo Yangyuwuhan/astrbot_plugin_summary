@@ -18,6 +18,18 @@
         "type": "bool",
         "default": true
     },
+    "enable_media_summary_tool": {
+        "description": "启用媒体总结工具",
+        "hint": "LLM 可在对话中自动调用以获取视频/音频的 AI 总结",
+        "type": "bool",
+        "default": true
+    },
+    "enable_media_subtitle_tool": {
+        "description": "启用字幕提取工具",
+        "hint": "LLM 可在对话中自动调用以获取视频/音频的原始字幕（含时间戳）",
+        "type": "bool",
+        "default": false
+    },
     "processing_timeout": {
         "description": "处理超时秒数",
         "hint": "生成总结和Bcut抽取的最大耗时(秒)",

@@ -4,12 +4,13 @@ import asyncio
 import uuid
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple, List, Any
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 from astrbot.api.message_components import Reply, Plain
 
@@ -21,6 +22,12 @@ from .core.transcriber.transcriber_model import TranscriptSegment
 from .core.parser.download import Downloader
 from .core.parser.config import PluginConfig
 from .core.parser.parsers.base import BaseParser
+from .core.parser.parsers.direct import DirectMediaParser
+from .core.tools.media_subtitle_tool import (
+    MediaSummaryTool,
+    MediaSubtitleTool,
+    segments_to_text,
+)
 
 
 class VideoSummaryPlugin(Star):
@@ -30,6 +37,7 @@ class VideoSummaryPlugin(Star):
         self.downloader = Downloader(self.cfg)
         self.transcriber = BcutTranscriber()
         self._debug = bool(getattr(self.cfg, "debug_mode", False))
+        self._direct_parser = DirectMediaParser(self.cfg, self.downloader)
 
         # 确保 temp_dir 与 cache_dir 为 Path 且存在
         self._temp_dir = Path(getattr(self.cfg, "temp_dir", Path.cwd() / "tmp"))
@@ -42,10 +50,20 @@ class VideoSummaryPlugin(Star):
 
         self._parser_patterns = self._build_parser_index()
 
+        tools = []
+        if getattr(self.cfg, "enable_media_summary_tool", True):
+            tools.append(MediaSummaryTool(plugin=self))
+        if getattr(self.cfg, "enable_media_subtitle_tool", False):
+            tools.append(MediaSubtitleTool(plugin=self))
+        if tools:
+            self.context.add_llm_tools(*tools)
+
     def _build_parser_index(self):
         """构建提取器索引"""
         patterns = []
         for parser_cls in BaseParser.get_all_subclass():
+            if parser_cls is DirectMediaParser:
+                continue
             parser_inst = parser_cls(self.cfg, self.downloader)
             # 聚合所有的配置里的白名单正则表达式
             # 这里简单直接聚合所有 parser 的 _key_patterns
@@ -102,6 +120,30 @@ class VideoSummaryPlugin(Star):
                     return parser_inst, keyword, searched
         return None, None, None
 
+    async def _resolve_url_with_direct_fallback(
+        self, url: str
+    ) -> Tuple[Optional[BaseParser], Optional[str], Optional[Any], bool]:
+        parser_inst, keyword, searched = await self._resolve_url(url)
+        if parser_inst:
+            return parser_inst, keyword, searched, False
+
+        direct_searched = self._direct_parser.match_direct_url(url)
+        if direct_searched:
+            return self._direct_parser, "direct", direct_searched, True
+
+        return None, None, None, False
+
+    async def _parse_result_with_parser(
+        self,
+        parser_inst: BaseParser,
+        url: str,
+        keyword: Optional[str],
+        searched: Optional[Any],
+    ):
+        if parser_inst is self._direct_parser:
+            return await self._direct_parser.parse_direct_url(url)
+        return await parser_inst.parse_with_redirect(url=url)
+
     async def _materialize_audio(self, parse_result) -> Tuple[Path, List[Path]]:
         """提取或转换第一份音频或视频素材得到 mp3 供 bcut 处理"""
         targets = []
@@ -119,12 +161,22 @@ class VideoSummaryPlugin(Star):
             except Exception:
                 pass
 
-        if parse_result.audio_contents:
-            source_path = await parse_result.audio_contents[0].get_path()
-        elif parse_result.video_contents:
-            source_path = await parse_result.video_contents[0].get_path()
+        source_path = None
+        last_error = None
+        for content_list in (parse_result.audio_contents, parse_result.video_contents):
+            if content_list:
+                try:
+                    source_path = await content_list[0].get_path()
+                    if source_path and source_path.exists():
+                        last_error = None
+                        break
+                except Exception as e:
+                    last_error = e
+                    continue
 
         if not source_path or not source_path.exists():
+            if last_error is not None:
+                raise last_error
             raise FileNotFoundError("未成功拉取到媒体文件实体")
         targets.append(source_path)
 
@@ -155,6 +207,27 @@ class VideoSummaryPlugin(Star):
             raise RuntimeError("ffmpeg 转换音频失败。")
 
         return out_mp3, targets
+
+    def _cleanup_temp_files(self, cleanup_targets: List[Path]):
+        # 彻底清理解析流程中产生的临时下载文件和 mp3
+        for target in cleanup_targets:
+            if target and target.exists():
+                try:
+                    if target.is_file():
+                        os.remove(target)
+                except Exception as e:
+                    logger.warning(f"未能删除临时文件 {target} : {e}")
+
+        # 清理 parser 阶段残留的临时文件，保留 cookies 目录以便复用持久化凭据
+        try:
+            if self._temp_dir and self._temp_dir.exists():
+                for item in self._temp_dir.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir() and item.name != "cookies":
+                        shutil.rmtree(item, ignore_errors=True)
+        except Exception:
+            pass
 
     @filter.command("总结")
     async def summarize_video(self, event: AstrMessageEvent, url: str = ""):
@@ -200,7 +273,9 @@ class VideoSummaryPlugin(Star):
             )
             return
 
-        parser_inst, keyword, searched = await self._resolve_url(url)
+        parser_inst, keyword, searched, used_direct_fallback = (
+            await self._resolve_url_with_direct_fallback(url)
+        )
         if not parser_inst:
             yield event.plain_result("❌ 未找到支持处理此链接的解析器")
             return
@@ -230,6 +305,7 @@ class VideoSummaryPlugin(Star):
         transcript = None
         title = "未知视频"
         tags = "通用视频"
+        direct_fallback_completed = False
         try:
             # 2. 命中字幕缓存时可跳过下载与转写
             if enable_cache and cache_url_match:
@@ -238,6 +314,8 @@ class VideoSummaryPlugin(Star):
                     transcript = {"segments": cached_trs}
                     title = str(cache_dict.get("title") or "缓存视频")
                     tags = str(cache_dict.get("tags") or "通用视频")
+                    if used_direct_fallback:
+                        direct_fallback_completed = True
                     if force_refresh:
                         yield event.plain_result(
                             "⏳ 强制总结：命中本地字幕缓存，正在交由 AI 重新思考..."
@@ -247,7 +325,18 @@ class VideoSummaryPlugin(Star):
 
             if not transcript:
                 # 3. 借助 parser 项目解析与下载
-                parse_result = await parser_inst.parse_with_redirect(url=url)
+                try:
+                    parse_result = await self._parse_result_with_parser(
+                        parser_inst=parser_inst,
+                        url=url,
+                        keyword=keyword,
+                        searched=searched,
+                    )
+                except Exception:
+                    if used_direct_fallback:
+                        yield event.plain_result("❌ 未找到支持处理此链接的解析器")
+                        return
+                    raise
 
                 if not parse_result.video_contents and not parse_result.audio_contents:
                     yield event.plain_result("❌ 未解析到可供总结的音频/视频对象")
@@ -266,6 +355,8 @@ class VideoSummaryPlugin(Star):
                     yield event.plain_result("❌ 无法获取视频转写内容")
                     return
                 transcript = {"segments": transcript_res.segments}
+                if used_direct_fallback:
+                    direct_fallback_completed = True
                 title = parse_result.title or "未知视频"
                 tags = "通用视频"
                 if parse_result.extra and "tags" in parse_result.extra:
@@ -294,120 +385,32 @@ class VideoSummaryPlugin(Star):
                 else:
                     segments_to_prompt.append(seg)
 
-            def format_time(seconds: float) -> str:
-                total = int(seconds)
-                hours, remainder = divmod(total, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                if hours > 0:
-                    return f"{hours}:{minutes:02d}:{seconds:02d}"
-                return f"{minutes:02d}:{seconds:02d}"
+            segment_text = segments_to_text(segments_to_prompt)
 
-            segment_text = "\n".join(
-                f"{format_time(segment.start)} - {segment.text.strip()}"
-                for segment in segments_to_prompt
-            )
-
-            # 模板目录和文件名（支持通过配置选择模板）
-            prompts_dir = Path(__file__).parent / "core" / "prompts"
-            prompts_dir.mkdir(parents=True, exist_ok=True)
-            template_name = (
-                getattr(self.cfg, "summary_template", "default.txt") or "default.txt"
-            )
-            template_path = prompts_dir / template_name
-
-            if not template_path.exists():
-                # 回退到默认模板文件
-                fallback = prompts_dir / "default.txt"
-                if fallback.exists():
-                    template_path = fallback
-                else:
-                    logger.error(f"模板文件不存在: {template_path}")
-                    yield event.plain_result(
-                        "❌ 模板文件不存在，无法生成总结，请检查插件 prompts 目录下是否包含模板 txt 文件"
-                    )
-                    return
-
+            start_t = time.time()
             try:
-                with open(template_path, "r", encoding="utf-8") as f:
-                    template_content = f.read()
-            except Exception as e:
-                logger.error(f"读取模板失败: {e}")
-                yield event.plain_result("❌ 无法读取模板文件，请检查模板权限与路径")
-                return
-
-            # 为避免 template 中或待填充文本中包含未转义的大括号导致 str.format 抛错，先对填充值中的大括号进行转义
-            def _escape_format(s: str) -> str:
-                return s.replace("{", "{{").replace("}", "}}")
-
-            safe_kwargs = {
-                "video_title": _escape_format(str(title)),
-                "tags": _escape_format(str(tags)),
-                "segment_text": _escape_format(str(segment_text)),
-            }
-
-            try:
-                prompt = template_content.format(**safe_kwargs)
-            except Exception as e:
-                logger.error(f"模板填充失败: {e}")
+                result = await self._call_llm_for_summary(
+                    title, tags, segment_text, event
+                )
+            except FileNotFoundError as e:
+                logger.error(str(e))
                 yield event.plain_result(
-                    "❌ 模板填充失败：模板或文本中可能包含无法解析的占位符"
+                    "❌ 模板文件不存在，无法生成总结，请检查插件 prompts 目录下是否包含模板 txt 文件"
                 )
                 return
-
-            # 获取对应的 LLM 提供商
-            provider_id = getattr(self.cfg, "llm_provider", "")
-            if provider_id:
-                provider = self.context.get_provider_by_id(provider_id)
-            else:
-                # 获取当前会话下默认分配的全局 LLM provider
-                curr_provider_id = await self.context.get_current_chat_provider_id(
-                    umo=event.unified_msg_origin
-                )
-                provider = self.context.get_provider_by_id(curr_provider_id)
-
-            if not provider:
+            except RuntimeError as e:
+                logger.error(str(e))
                 yield event.plain_result(
                     "❌ 未配置 LLM Provider，或者指定了不存在的 LLM。请在 AstrBot 设置中配置"
                 )
                 return
-
-            # 根据处理时长限定
-            timeout = getattr(self.cfg, "processing_timeout", 120)
-            chat_coro = provider.text_chat(
-                prompt=prompt, session_id=f"VideoSummary_{uuid.uuid4().hex}"
-            )
-
-            start_t = time.time()
-            response = await asyncio.wait_for(chat_coro, timeout=timeout)
             ai_cost_time = time.time() - start_t
-
-            if hasattr(response, "completion_text"):
-                result = response.completion_text
-            elif isinstance(response, str):
-                result = response
-            else:
-                result = str(response)
-
-            # 调用参考自 markdown_killer 的清理逻辑去除 Markdown
-            result = self._remove_markdown(result)
 
             # 保存总结缓存
             if enable_cache:
                 self._write_json_cache(url_hash, "summary", result, url=url)
             if getattr(self.cfg, "show_token_usage", False):
-                input_tokens = 0
-                output_tokens = 0
-                if (
-                    not isinstance(response, str)
-                    and hasattr(response, "usage")
-                    and response.usage
-                ):
-                    usage = response.usage
-                    input_tokens = getattr(usage, "input_other", 0) + getattr(
-                        usage, "input_cached", 0
-                    )
-                    output_tokens = getattr(usage, "output", 0)
-                result += f"\n━━━━━━━━━━━━━━\n输入: {input_tokens} tokens\n输出: {output_tokens} tokens\n耗时: {ai_cost_time:.2f} s"
+                result += f"\n━━━━━━━━━━━━━━\n耗时: {ai_cost_time:.2f} s"
 
             yield event.plain_result(f"📌 视频总结\n\n{result}")
 
@@ -415,31 +418,80 @@ class VideoSummaryPlugin(Star):
             logger.error("视频总结超时")
             yield event.plain_result("❌ 总结生成超时，视频可能过长。")
         except Exception as e:
+            if used_direct_fallback and not direct_fallback_completed:
+                logger.warning(f"直链回退提取失败: {e}")
+                yield event.plain_result("❌ 未找到支持处理此链接的解析器")
+                return
             logger.error(f"视频总结失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 总结生成失败: {str(e)}")
 
         finally:
-            import shutil
+            self._cleanup_temp_files(cleanup_targets)
 
-            # 彻底清理解析流程中产生的临时下载文件和 mp3
-            for target in cleanup_targets:
-                if target and target.exists():
-                    try:
-                        if target.is_file():
-                            os.remove(target)
-                    except Exception as e:
-                        logger.warning(f"未能删除临时文件 {target} : {e}")
+    async def _call_llm_for_summary(
+        self,
+        title: str,
+        tags: str,
+        segment_text: str,
+        event: AstrMessageEvent | None = None,
+    ) -> str:
+        """加载模板、调用 LLM 生成总结，返回纯文本结果。"""
+        prompts_dir = Path(__file__).parent / "core" / "prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        template_name = (
+            getattr(self.cfg, "summary_template", "default.txt") or "default.txt"
+        )
+        template_path = prompts_dir / template_name
+        if not template_path.exists():
+            fallback = prompts_dir / "default.txt"
+            if fallback.exists():
+                template_path = fallback
+            else:
+                raise FileNotFoundError(f"模板文件不存在: {template_path}")
 
-            # 清理 parser 阶段残留的临时文件，保留 cookies 目录以便复用持久化凭据
-            try:
-                if self._temp_dir and self._temp_dir.exists():
-                    for item in self._temp_dir.iterdir():
-                        if item.is_file():
-                            item.unlink(missing_ok=True)
-                        elif item.is_dir() and item.name != "cookies":
-                            shutil.rmtree(item, ignore_errors=True)
-            except Exception:
-                pass
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_content = f.read()
+
+        def _escape_format(s: str) -> str:
+            return s.replace("{", "{{").replace("}", "}}")
+
+        safe_kwargs = {
+            "video_title": _escape_format(str(title)),
+            "tags": _escape_format(str(tags)),
+            "segment_text": _escape_format(str(segment_text)),
+        }
+        prompt = template_content.format(**safe_kwargs)
+
+        provider_id = getattr(self.cfg, "llm_provider", "")
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+        elif event is not None:
+            curr_provider_id = await self.context.get_current_chat_provider_id(
+                umo=event.unified_msg_origin
+            )
+            provider = self.context.get_provider_by_id(curr_provider_id)
+        else:
+            provider = None
+
+        if not provider:
+            raise RuntimeError(
+                "未配置 LLM Provider。请在插件配置中设置 llm_provider 或在 AstrBot 全局设置中配置"
+            )
+
+        timeout = getattr(self.cfg, "processing_timeout", 120)
+        chat_coro = provider.text_chat(
+            prompt=prompt, session_id=f"VideoSummary_{uuid.uuid4().hex}"
+        )
+        response = await asyncio.wait_for(chat_coro, timeout=timeout)
+
+        if hasattr(response, "completion_text"):
+            result = response.completion_text
+        elif isinstance(response, str):
+            result = response
+        else:
+            result = str(response)
+
+        return self._remove_markdown(result)
 
     def _remove_markdown(self, text: str) -> str:
         """

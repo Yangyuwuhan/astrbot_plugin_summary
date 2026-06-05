@@ -1,6 +1,7 @@
 from .acfun import AcfunParser
 from .base import BaseParser
 from .bilibili import BilibiliParser
+from .direct import DirectMediaParser
 from .douyin import DouyinParser
 from .instagram import InstagramParser
 from .kuaishou import KuaiShouParser
@@ -18,6 +19,7 @@ __all__ = [
     "BaseParser",
     "AcfunParser",
     "BilibiliParser",
+    "DirectMediaParser",
     "DouyinParser",
     "InstagramParser",
     "KuaiShouParser",

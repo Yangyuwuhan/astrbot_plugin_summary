@@ -110,6 +110,12 @@ DEFAULT_PARSERS_TEMPLATE: list[dict[str, Any]] = [
         "show_body_text": True,
         "video_send_mode": "first",
     },
+    {
+        "__template_key": "direct",
+        "enable": True,
+        "use_proxy": False,
+        "cookies": "",
+    },
 ]
 
 
@@ -273,6 +279,7 @@ class ParserItem(ConfigNode):
 class ParserConfig(ConfigNodeContainer):
     acfun: ParserItem
     bilibili: ParserItem
+    direct: ParserItem
     douyin: ParserItem
     instagram: ParserItem
     kuaishou: ParserItem
@@ -304,6 +311,8 @@ class PluginConfig(ConfigNode):
 
     show_token_usage: bool
     enable_cache: bool
+    enable_media_summary_tool: bool
+    enable_media_subtitle_tool: bool
     processing_timeout: int
 
     whitelist: list[str]
