@@ -1,5 +1,18 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.1.2] - 2026-06-05
+
+### 优化
+
+- LLM 工具返回结果不再附带标题/标签/说明前缀，直接返回正文内容，与 `/总结` 命令格式一致
+- 工具日志中增加缓存命中记录，结果日志截断至 70 字符预览，避免刷屏
+- 移除未使用的 `debug_mode` 和 `show_download_fail_tip` 配置项
+
+---
+
+<details>
+<summary>📋 点击查看历史更新日志</summary>
+
 ## [v1.1.1] - 2026-06-05
 
 ### 新增
@@ -29,11 +42,6 @@
 - 工具注册从 `@filter.llm_tool` 装饰器改为 `FunctionTool` 子类 + `add_llm_tools` 动态注册，支持通过配置热重载控制开关。
 - 优化 `DirectMediaParser` 的 `title` 和 `text` 字段，从 URL 提取文件名。
 - 移除 `main.py` 中未使用的 `register` 导入（新版 AstrBot 通过 Star 基类自动注册）。
-
----
-
-<details>
-<summary>📋 点击查看历史更新日志</summary>
 
 ## [v1.0.1] - 2026-06-05
 

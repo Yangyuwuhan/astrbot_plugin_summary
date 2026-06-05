@@ -64,6 +64,7 @@ async def _extract_transcript(
         if enable_cache and cache_url_match:
             cached_trs = cache_dict.get("transcript")
             if cached_trs:
+                logger.info(f"LLM 工具命中字幕缓存: {url}")
                 transcript = {"segments": cached_trs}
                 title = str(cache_dict.get("title") or "缓存视频")
                 tags = str(cache_dict.get("tags") or "通用视频")
@@ -146,13 +147,12 @@ async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str, umo: s
         return "❌ 当前会话无权使用字幕提取功能（不在白名单中或在黑名单中）"
     try:
         title, tags, subtitle_text = await _extract_transcript(plugin, url)
-        logger.info(f"LLM 工具 summary_extract_media_subtitle 成功: {title}")
-        return (
-            f"标题: {title}\n"
-            f"标签: {tags}\n"
-            "说明: 本结果仅基于音频进行字幕提取，无法真正理解视频画面。\n"
-            f"字幕内容:\n{subtitle_text}"
+        result_preview = subtitle_text[:70].replace("\n", " ")
+        logger.info(
+            f"LLM 工具 summary_extract_media_subtitle 成功: {title}，"
+            f"共计 {len(subtitle_text)} 字符，预览: {result_preview}..."
         )
+        return subtitle_text
     except ValueError as e:
         logger.warning(f"LLM 工具 summary_extract_media_subtitle 失败: {e}")
         return f"❌ {e}"
@@ -166,13 +166,12 @@ async def run_media_summary_tool(plugin: "VideoSummaryPlugin", url: str, umo: st
     try:
         title, tags, subtitle_text = await _extract_transcript(plugin, url)
         summary = await plugin._call_llm_for_summary(title, tags, subtitle_text)
-        logger.info(f"LLM 工具 summary_extract_media_summary 成功: {title}")
-        return (
-            f"标题: {title}\n"
-            f"标签: {tags}\n"
-            "说明: 本结果仅基于音频进行内容总结，无法真正理解视频画面。\n"
-            f"AI 总结:\n{summary}"
+        result_preview = summary[:70].replace("\n", " ")
+        logger.info(
+            f"LLM 工具 summary_extract_media_summary 成功: {title}，"
+            f"共计 {len(summary)} 字符，预览: {result_preview}..."
         )
+        return summary
     except ValueError as e:
         logger.warning(f"LLM 工具 summary_extract_media_summary 失败: {e}")
         return f"❌ {e}"
