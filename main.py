@@ -1,3 +1,6 @@
+# author: Yangyuwuhan
+# repo: https://github.com/Yangyuwuhan/astrbot_plugin_summary
+
 import re
 import time
 import asyncio
@@ -287,9 +290,12 @@ class VideoSummaryPlugin(Star):
             )
             return
 
-        parser_inst, keyword, searched, used_direct_fallback = (
-            await self._resolve_url_with_direct_fallback(url)
-        )
+        (
+            parser_inst,
+            keyword,
+            searched,
+            used_direct_fallback,
+        ) = await self._resolve_url_with_direct_fallback(url)
         if not parser_inst:
             yield event.plain_result("❌ 未找到支持处理此链接的解析器")
             return
