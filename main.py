@@ -36,7 +36,6 @@ class VideoSummaryPlugin(Star):
         self.cfg = PluginConfig(config, context=context)
         self.downloader = Downloader(self.cfg)
         self.transcriber = BcutTranscriber()
-        self._debug = bool(getattr(self.cfg, "debug_mode", False))
         self._direct_parser = DirectMediaParser(self.cfg, self.downloader)
 
         # 确保 temp_dir 与 cache_dir 为 Path 且存在
@@ -229,15 +228,30 @@ class VideoSummaryPlugin(Star):
         except Exception:
             pass
 
+    def _check_access(self, umo: str) -> bool:
+        whitelist = getattr(self.cfg, "whitelist", None) or []
+        blacklist = getattr(self.cfg, "blacklist", None) or []
+        if whitelist and umo not in whitelist:
+            return False
+        if blacklist and umo in blacklist:
+            return False
+        return True
+
     @filter.command("总结")
     async def summarize_video(self, event: AstrMessageEvent, url: str = ""):
         """总结任意视频链接: /总结 <URL>"""
+        if not self._check_access(event.unified_msg_origin):
+            yield event.plain_result("❌ 你没有权限使用此功能")
+            return
         async for result in self._summarize_video_impl(event, url, force_refresh=False):
             yield result
 
     @filter.command("强制总结")
     async def force_summarize_video(self, event: AstrMessageEvent, url: str = ""):
         """强制重新总结任意视频链接: /强制总结 <URL>"""
+        if not self._check_access(event.unified_msg_origin):
+            yield event.plain_result("❌ 你没有权限使用此功能")
+            return
         async for result in self._summarize_video_impl(event, url, force_refresh=True):
             yield result
 

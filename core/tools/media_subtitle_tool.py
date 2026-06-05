@@ -139,9 +139,11 @@ async def _extract_transcript(
         plugin._cleanup_temp_files(cleanup_targets)
 
 
-async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str) -> str:
+async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str, umo: str = "") -> str:
     """提取字幕文本，返回含时间戳的原始字幕。"""
     logger.info(f"LLM 工具 summary_extract_media_subtitle 被调用，URL: {url}")
+    if not plugin._check_access(umo):
+        return "❌ 当前会话无权使用字幕提取功能（不在白名单中或在黑名单中）"
     try:
         title, tags, subtitle_text = await _extract_transcript(plugin, url)
         logger.info(f"LLM 工具 summary_extract_media_subtitle 成功: {title}")
@@ -156,9 +158,11 @@ async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str) -> str
         return f"❌ {e}"
 
 
-async def run_media_summary_tool(plugin: "VideoSummaryPlugin", url: str) -> str:
+async def run_media_summary_tool(plugin: "VideoSummaryPlugin", url: str, umo: str = "") -> str:
     """提取字幕并交由 AI 总结后返回精炼摘要。"""
     logger.info(f"LLM 工具 summary_extract_media_summary 被调用，URL: {url}")
+    if not plugin._check_access(umo):
+        return "❌ 当前会话无权使用媒体总结功能（不在白名单中或在黑名单中）"
     try:
         title, tags, subtitle_text = await _extract_transcript(plugin, url)
         summary = await plugin._call_llm_for_summary(title, tags, subtitle_text)
@@ -202,7 +206,8 @@ class MediaSummaryTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], url: str
     ) -> ToolExecResult:
-        return await run_media_summary_tool(self.plugin, url)
+        umo = getattr(context.context.event, "unified_msg_origin", "")
+        return await run_media_summary_tool(self.plugin, url, umo)
 
 
 @dataclass
@@ -234,4 +239,5 @@ class MediaSubtitleTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], url: str
     ) -> ToolExecResult:
-        return await run_media_subtitle_tool(self.plugin, url)
+        umo = getattr(context.context.event, "unified_msg_origin", "")
+        return await run_media_subtitle_tool(self.plugin, url, umo)

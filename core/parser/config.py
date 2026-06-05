@@ -304,8 +304,6 @@ class ParserConfig(ConfigNodeContainer):
 
 
 class PluginConfig(ConfigNode):
-    debug_mode: bool
-
     llm_provider: str
     summary_template: str | None
 
@@ -321,7 +319,6 @@ class PluginConfig(ConfigNode):
     source_max_size: int
     source_max_minute: int
 
-    show_download_fail_tip: bool
     download_timeout: int
     download_retry_times: int
     common_timeout: int
