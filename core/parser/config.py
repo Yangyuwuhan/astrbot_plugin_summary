@@ -242,7 +242,7 @@ class ConfigNodeContainer:
             return self._nodes[name]
 
         if hasattr(self, "_item_cls") and not name.startswith("_"):
-            dummy_node = self._item_cls({self._key_name: name, "enable": True})
+            dummy_node = self._item_cls({self._key_name: name, "enable": False})
             self._nodes[name] = dummy_node
             return dummy_node
 

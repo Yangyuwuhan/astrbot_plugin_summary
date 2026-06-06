@@ -1,10 +1,10 @@
 import json
 import logging
+import threading
 import time
 from typing import Optional, List
 
 import requests
-from requests import RequestException
 
 from .transcriber_model import TranscriptSegment, TranscriptResult
 
@@ -15,6 +15,7 @@ API_REQ_UPLOAD = API_BASE_URL + "/resource/create"
 API_COMMIT_UPLOAD = API_BASE_URL + "/resource/create/complete"
 API_CREATE_TASK = API_BASE_URL + "/task"
 API_QUERY_RESULT = API_BASE_URL + "/task/result"
+DEFAULT_REQUEST_TIMEOUT = 30.0
 
 
 class BcutTranscriber:
@@ -25,8 +26,10 @@ class BcutTranscriber:
         "Content-Type": "application/json",
     }
 
-    def __init__(self):
+    def __init__(self, request_timeout: float = DEFAULT_REQUEST_TIMEOUT):
         self.session = requests.Session()
+        self.request_timeout = request_timeout
+        self._lock = threading.Lock()
         self.task_id = None
         self.__etags: List[str] = []
         self.__in_boss_key: Optional[str] = None
@@ -37,11 +40,46 @@ class BcutTranscriber:
         self.__clips: Optional[int] = None
         self.__download_url: Optional[str] = None
 
+    def close(self) -> None:
+        self.session.close()
+
+    def _reset_state(self) -> None:
+        self.task_id = None
+        self.__etags = []
+        self.__in_boss_key = None
+        self.__resource_id = None
+        self.__upload_id = None
+        self.__upload_urls = []
+        self.__per_size = None
+        self.__clips = None
+        self.__download_url = None
+
+    @staticmethod
+    def _deadline(timeout: float | None) -> float | None:
+        if timeout is None or timeout <= 0:
+            return None
+        return time.monotonic() + timeout
+
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("必剪ASR处理超时")
+        return remaining
+
+    def _request_timeout(self, deadline: float | None) -> float:
+        remaining = self._remaining(deadline)
+        if remaining is None:
+            return self.request_timeout
+        return max(1.0, min(self.request_timeout, remaining))
+
     def _load_file(self, file_path: str) -> bytes:
         with open(file_path, "rb") as f:
             return f.read()
 
-    def _upload(self, file_path: str) -> None:
+    def _upload(self, file_path: str, deadline: float | None = None) -> None:
         """申请上传并执行分片上传"""
         file_binary = self._load_file(file_path)
         if not file_binary:
@@ -57,7 +95,12 @@ class BcutTranscriber:
             }
         )
 
-        resp = self.session.post(API_REQ_UPLOAD, data=payload, headers=self.headers)
+        resp = self.session.post(
+            API_REQ_UPLOAD,
+            data=payload,
+            headers=self.headers,
+            timeout=self._request_timeout(deadline),
+        )
         resp.raise_for_status()
         resp = resp.json()
         resp_data = resp["data"]
@@ -70,24 +113,26 @@ class BcutTranscriber:
         self.__clips = len(resp_data["upload_urls"])
 
         logger.info(f"申请上传成功, {self.__clips}分片")
-        self.__upload_part(file_binary)
-        self.__commit_upload()
+        self.__upload_part(file_binary, deadline=deadline)
+        self.__commit_upload(deadline=deadline)
 
-    def __upload_part(self, file_binary: bytes) -> None:
+    def __upload_part(self, file_binary: bytes, deadline: float | None = None) -> None:
         """上传音频分片"""
-        for clip in range(self.__clips):
+        for clip in range(self.__clips or 0):
+            self._remaining(deadline)
             start_range = clip * self.__per_size
             end_range = min((clip + 1) * self.__per_size, len(file_binary))
             resp = self.session.put(
                 self.__upload_urls[clip],
                 data=file_binary[start_range:end_range],
                 headers={"Content-Type": "application/octet-stream"},
+                timeout=self._request_timeout(deadline),
             )
             resp.raise_for_status()
             etag = resp.headers.get("Etag", "").strip('"')
             self.__etags.append(etag)
 
-    def __commit_upload(self) -> None:
+    def __commit_upload(self, deadline: float | None = None) -> None:
         """提交上传"""
         data = json.dumps(
             {
@@ -98,7 +143,12 @@ class BcutTranscriber:
                 "model_id": "8",
             }
         )
-        resp = self.session.post(API_COMMIT_UPLOAD, data=data, headers=self.headers)
+        resp = self.session.post(
+            API_COMMIT_UPLOAD,
+            data=data,
+            headers=self.headers,
+            timeout=self._request_timeout(deadline),
+        )
         resp.raise_for_status()
         resp = resp.json()
 
@@ -107,12 +157,13 @@ class BcutTranscriber:
 
         self.__download_url = resp["data"]["download_url"]
 
-    def _create_task(self) -> str:
+    def _create_task(self, deadline: float | None = None) -> str:
         """创建转写任务"""
         resp = self.session.post(
             API_CREATE_TASK,
             json={"resource": self.__download_url, "model_id": "8"},
             headers=self.headers,
+            timeout=self._request_timeout(deadline),
         )
         resp.raise_for_status()
         resp = resp.json()
@@ -123,12 +174,13 @@ class BcutTranscriber:
         self.task_id = resp["data"]["task_id"]
         return self.task_id
 
-    def _query_result(self) -> dict:
+    def _query_result(self, deadline: float | None = None) -> dict:
         """查询转写结果"""
         resp = self.session.get(
             API_QUERY_RESULT,
             params={"model_id": 8, "task_id": self.task_id},
             headers=self.headers,
+            timeout=self._request_timeout(deadline),
         )
         resp.raise_for_status()
         resp = resp.json()
@@ -138,57 +190,61 @@ class BcutTranscriber:
 
         return resp["data"]
 
-    def transcript(self, file_path: str) -> TranscriptResult:
+    def transcript(self, file_path: str, timeout: float | None = None) -> TranscriptResult:
         """执行语音转写"""
-        try:
-            logger.info(f"开始处理文件: {file_path}")
+        with self._lock:
+            deadline = self._deadline(timeout)
+            try:
+                logger.info(f"开始处理文件: {file_path}")
 
-            self.__etags = []
-            self._upload(file_path)
-            self._create_task()
+                self._reset_state()
+                self._upload(file_path, deadline=deadline)
+                self._create_task(deadline=deadline)
 
-            task_resp = None
-            max_retries = 500
-            for i in range(max_retries):
-                task_resp = self._query_result()
+                task_resp = None
+                max_retries = 500
+                for i in range(max_retries):
+                    self._remaining(deadline)
+                    task_resp = self._query_result(deadline=deadline)
 
-                if task_resp["state"] == 4:
-                    break
-                elif task_resp["state"] == 3:
-                    raise Exception(f"转写任务失败，状态码: {task_resp['state']}")
+                    if task_resp["state"] == 4:
+                        break
+                    elif task_resp["state"] == 3:
+                        raise Exception(f"转写任务失败，状态码: {task_resp['state']}")
 
-                if i % 10 == 0:
-                    logger.info(f"转录进行中... {i}/{max_retries}")
+                    if i % 10 == 0:
+                        logger.info(f"转录进行中... {i}/{max_retries}")
 
-                time.sleep(1)
+                    remaining = self._remaining(deadline)
+                    time.sleep(min(1.0, remaining) if remaining is not None else 1.0)
 
-            if not task_resp or task_resp["state"] != 4:
-                raise Exception(
-                    f"转写超时，状态: {task_resp.get('state') if task_resp else 'Unknown'}"
+                if not task_resp or task_resp["state"] != 4:
+                    raise Exception(
+                        f"转写超时，状态: {task_resp.get('state') if task_resp else 'Unknown'}"
+                    )
+
+                result_json = json.loads(task_resp["result"])
+
+                segments = []
+                full_text = ""
+
+                for u in result_json.get("utterances", []):
+                    text = u.get("transcript", "").strip()
+                    start_time = float(u.get("start_time", 0)) / 1000.0
+                    end_time = float(u.get("end_time", 0)) / 1000.0
+
+                    full_text += text + " "
+                    segments.append(
+                        TranscriptSegment(start=start_time, end=end_time, text=text)
+                    )
+
+                return TranscriptResult(
+                    language=result_json.get("language", "zh"),
+                    full_text=full_text.strip(),
+                    segments=segments,
+                    raw=result_json,
                 )
 
-            result_json = json.loads(task_resp["result"])
-
-            segments = []
-            full_text = ""
-
-            for u in result_json.get("utterances", []):
-                text = u.get("transcript", "").strip()
-                start_time = float(u.get("start_time", 0)) / 1000.0
-                end_time = float(u.get("end_time", 0)) / 1000.0
-
-                full_text += text + " "
-                segments.append(
-                    TranscriptSegment(start=start_time, end=end_time, text=text)
-                )
-
-            return TranscriptResult(
-                language=result_json.get("language", "zh"),
-                full_text=full_text.strip(),
-                segments=segments,
-                raw=result_json,
-            )
-
-        except Exception as e:
-            logger.error(f"必剪ASR处理失败: {str(e)}")
-            raise
+            except Exception as e:
+                logger.error(f"必剪ASR处理失败: {str(e)}")
+                raise

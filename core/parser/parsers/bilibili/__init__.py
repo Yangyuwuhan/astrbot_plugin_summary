@@ -399,27 +399,89 @@ class BilibiliParser(BaseParser):
             VideoStreamDownloadURL,
         )
 
+        def pick_url(item: dict | None) -> str | None:
+            if not isinstance(item, dict):
+                return None
+            return item.get("baseUrl") or item.get("base_url")
+
+        def pick_best_stream(items: list | None) -> dict | None:
+            if not isinstance(items, list):
+                return None
+            candidates = [item for item in items if pick_url(item)]
+            if not candidates:
+                return None
+            return max(
+                candidates,
+                key=lambda item: item.get("bandwidth") or item.get("id") or 0,
+            )
+
         if video is None:
             video = await self._get_video(bvid=bvid, avid=avid)
 
         # 获取下载数据
         download_url_data = await video.get_download_url(page_index=page_index)
-        detecter = VideoDownloadURLDataDetecter(download_url_data)
-        streams = detecter.detect_best_streams(
-            video_max_quality=self.video_quality,
-            codecs=[self.video_codecs],
-            no_dolby_video=True,
-            no_hdr=True,
-        )
-        video_stream = streams[0]
-        if not isinstance(video_stream, VideoStreamDownloadURL):
-            raise DownloadException("未找到可下载的视频流")
-        logger.debug(
-            f"视频流质量: {video_stream.video_quality.name}, 编码: {video_stream.video_codecs}"
-        )
+        dash_data = download_url_data.get("dash") or {}
+        if not isinstance(dash_data, dict):
+            dash_data = {}
 
-        audio_stream = streams[1]
-        if not isinstance(audio_stream, AudioStreamDownloadURL):
-            return video_stream.url, None
-        logger.debug(f"音频流质量: {audio_stream.audio_quality.name}")
-        return video_stream.url, audio_stream.url
+        audio_item = pick_best_stream(dash_data.get("audio"))
+        audio_url = pick_url(audio_item)
+        if audio_url:
+            audio_id = audio_item.get("id") if audio_item else "unknown"
+            logger.debug(f"音频流质量: {audio_id}")
+            return audio_url, audio_url
+
+        flac_data = dash_data.get("flac")
+        if isinstance(flac_data, dict):
+            audio_url = pick_url(flac_data.get("audio"))
+            if audio_url:
+                logger.debug("使用 FLAC 音频流")
+                return audio_url, audio_url
+
+        dolby_data = dash_data.get("dolby")
+        if isinstance(dolby_data, dict):
+            dolby_item = pick_best_stream(dolby_data.get("audio"))
+            audio_url = pick_url(dolby_item)
+            if audio_url:
+                logger.debug("使用杜比音频流")
+                return audio_url, audio_url
+
+        try:
+            detecter = VideoDownloadURLDataDetecter(download_url_data)
+            streams = detecter.detect_best_streams(
+                video_max_quality=self.video_quality,
+                codecs=[self.video_codecs],
+                no_dolby_video=True,
+                no_hdr=True,
+            )
+        except AttributeError as exc:
+            if "NoneType" not in str(exc) and "value" not in str(exc):
+                raise
+            logger.warning(
+                "B站下载流编码信息异常，已跳过第三方库最佳流检测并尝试使用原始视频流"
+            )
+            streams = []
+
+        if streams:
+            video_stream = streams[0]
+            if not isinstance(video_stream, VideoStreamDownloadURL):
+                raise DownloadException("未找到可下载的视频流")
+            logger.debug(
+                f"视频流质量: {video_stream.video_quality.name}, 编码: {video_stream.video_codecs}"
+            )
+
+            audio_stream = streams[1] if len(streams) > 1 else None
+            if not isinstance(audio_stream, AudioStreamDownloadURL):
+                return video_stream.url, None
+            logger.debug(f"音频流质量: {audio_stream.audio_quality.name}")
+            return video_stream.url, audio_stream.url
+
+        video_item = pick_best_stream(dash_data.get("video"))
+        video_url = pick_url(video_item)
+        if video_url:
+            logger.debug("使用原始视频流作为下载兜底")
+            return video_url, None
+
+        raise DownloadException(
+            "B站下载流解析失败，可能是该视频清晰度/编码数据异常，请稍后重试或配置 B站 Cookie"
+        )

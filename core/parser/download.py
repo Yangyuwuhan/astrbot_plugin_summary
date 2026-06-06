@@ -2,6 +2,7 @@ from asyncio import Task, TimeoutError, create_task, gather, sleep, to_thread
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
+from time import monotonic
 from typing import Any, ParamSpec, TypeVar
 
 import aiofiles
@@ -118,16 +119,35 @@ class Downloader:
                         raise SizeLimitException
 
                     downloaded = 0
-                    with self.get_progress_bar(file_name, content_length) as bar:
-                        async with aiofiles.open(file_path, "wb") as file:
-                            async for chunk in response.content.iter_chunked(
-                                1024 * 1024
-                            ):
-                                downloaded += len(chunk)
-                                if downloaded > max_bytes:
-                                    raise SizeLimitException
-                                await file.write(chunk)
-                                bar.update(len(chunk))
+                    next_log_percent = 10
+                    last_log_time = monotonic()
+                    total_desc = (
+                        f"{content_length / 1024 / 1024:.2f} MB"
+                        if content_length
+                        else "未知大小"
+                    )
+                    logger.info(f"开始下载媒体: {file_name}, 大小: {total_desc}")
+
+                    async with aiofiles.open(file_path, "wb") as file:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                raise SizeLimitException
+                            await file.write(chunk)
+
+                            if content_length:
+                                percent = int(downloaded * 100 / content_length)
+                                if percent >= next_log_percent:
+                                    logger.info(
+                                        f"下载进度: {file_name} {min(percent, 100)}% "
+                                        f"({downloaded / 1024 / 1024:.2f}/{content_length / 1024 / 1024:.2f} MB)"
+                                    )
+                                    next_log_percent += 10
+                            elif monotonic() - last_log_time >= 5:
+                                logger.info(
+                                    f"下载进度: {file_name} 已下载 {downloaded / 1024 / 1024:.2f} MB"
+                                )
+                                last_log_time = monotonic()
 
                     if downloaded == 0:
                         logger.warning(f"媒体 url: {url}, 实际大小为 0, 取消下载")
@@ -136,6 +156,9 @@ class Downloader:
                         raise ClientError(
                             f"HTTP payload incomplete {downloaded}/{content_length}"
                         )
+                    logger.info(
+                        f"下载完成: {file_name}, 实际大小: {downloaded / 1024 / 1024:.2f} MB"
+                    )
 
                 return file_path
             except (ZeroSizeException, SizeLimitException):

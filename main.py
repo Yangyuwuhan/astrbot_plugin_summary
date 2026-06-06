@@ -6,7 +6,6 @@ import time
 import asyncio
 import uuid
 import json
-import os
 import shutil
 from pathlib import Path
 from typing import Optional, Tuple, List, Any
@@ -31,6 +30,15 @@ from .core.tools.media_subtitle_tool import (
     MediaSubtitleTool,
     segments_to_text,
 )
+
+
+class _ProcessingConfigProxy:
+    def __init__(self, base_cfg: PluginConfig, temp_dir: Path):
+        self._base_cfg = base_cfg
+        self.temp_dir = temp_dir
+
+    def __getattr__(self, name: str):
+        return getattr(self._base_cfg, name)
 
 
 class VideoSummaryPlugin(Star):
@@ -60,18 +68,73 @@ class VideoSummaryPlugin(Star):
         if tools:
             self.context.add_llm_tools(*tools)
 
-    def _build_parser_index(self):
-        """构建提取器索引"""
+    def _is_parser_enabled(self, platform_name: str) -> bool:
+        parser_nodes = getattr(getattr(self.cfg, "parser", None), "_nodes", {})
+        parser_cfg = parser_nodes.get(platform_name)
+        if parser_cfg is None:
+            return False
+        return bool(getattr(parser_cfg, "enable", False))
+
+    def _build_parser_index(
+        self, cfg: Optional[PluginConfig] = None, downloader: Optional[Downloader] = None
+    ):
+        """构建已启用的提取器索引"""
+        cfg = cfg or self.cfg
+        downloader = downloader or self.downloader
         patterns = []
         for parser_cls in BaseParser.get_all_subclass():
             if parser_cls is DirectMediaParser:
                 continue
-            parser_inst = parser_cls(self.cfg, self.downloader)
-            # 聚合所有的配置里的白名单正则表达式
-            # 这里简单直接聚合所有 parser 的 _key_patterns
+            platform_name = getattr(parser_cls.platform, "name", "")
+            if not self._is_parser_enabled(platform_name):
+                continue
+            parser_inst = parser_cls(cfg, downloader)
             for keyword, pattern in getattr(parser_inst, "_key_patterns", []):
                 patterns.append((keyword, pattern, parser_inst))
         return patterns
+
+    def _create_processing_runtime(self) -> dict[str, Any]:
+        temp_dir = self._temp_dir / f"job-{uuid.uuid4().hex}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        cfg = _ProcessingConfigProxy(self.cfg, temp_dir)
+        downloader = Downloader(cfg)
+        direct_parser = DirectMediaParser(cfg, downloader)
+        return {
+            "temp_dir": temp_dir,
+            "downloader": downloader,
+            "direct_parser": direct_parser,
+            "parser_patterns": self._build_parser_index(cfg=cfg, downloader=downloader),
+        }
+
+    async def _close_processing_runtime(self, runtime: Optional[dict[str, Any]]):
+        if not runtime:
+            return
+
+        parser_instances = {
+            id(parser): parser for _, _, parser in runtime.get("parser_patterns", [])
+        }
+        direct_parser = runtime.get("direct_parser")
+        if direct_parser is not None:
+            parser_instances[id(direct_parser)] = direct_parser
+
+        for parser in parser_instances.values():
+            close_session = getattr(parser, "close_session", None)
+            if close_session:
+                try:
+                    await close_session()
+                except Exception as e:
+                    logger.warning(f"关闭解析器会话失败: {e}")
+
+        downloader = runtime.get("downloader")
+        if downloader is not None:
+            try:
+                await downloader.close()
+            except Exception as e:
+                logger.warning(f"关闭下载器会话失败: {e}")
+
+        temp_dir = runtime.get("temp_dir")
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _extract_first_http(self, text: str) -> Optional[str]:
         """从文本中提取第一个以 http/https 开头的链接，去掉末尾常见标点。
@@ -113,9 +176,10 @@ class VideoSummaryPlugin(Star):
             json.dump(data, f, ensure_ascii=False, indent=4)
 
     async def _resolve_url(
-        self, url: str
+        self, url: str, parser_patterns: Optional[list] = None
     ) -> Tuple[Optional[BaseParser], Optional[str], Optional[Any]]:
-        for keyword, pattern, parser_inst in self._parser_patterns:
+        patterns = self._parser_patterns if parser_patterns is None else parser_patterns
+        for keyword, pattern, parser_inst in patterns:
             if keyword in url:
                 searched = pattern.search(url)
                 if searched:
@@ -123,15 +187,22 @@ class VideoSummaryPlugin(Star):
         return None, None, None
 
     async def _resolve_url_with_direct_fallback(
-        self, url: str
+        self,
+        url: str,
+        parser_patterns: Optional[list] = None,
+        direct_parser: Optional[DirectMediaParser] = None,
     ) -> Tuple[Optional[BaseParser], Optional[str], Optional[Any], bool]:
-        parser_inst, keyword, searched = await self._resolve_url(url)
+        parser_inst, keyword, searched = await self._resolve_url(
+            url, parser_patterns=parser_patterns
+        )
         if parser_inst:
             return parser_inst, keyword, searched, False
 
-        direct_searched = self._direct_parser.match_direct_url(url)
-        if direct_searched:
-            return self._direct_parser, "direct", direct_searched, True
+        if self._is_parser_enabled("direct"):
+            direct_parser = direct_parser or self._direct_parser
+            direct_searched = direct_parser.match_direct_url(url)
+            if direct_searched:
+                return direct_parser, "direct", direct_searched, True
 
         return None, None, None, False
 
@@ -142,39 +213,82 @@ class VideoSummaryPlugin(Star):
         keyword: Optional[str],
         searched: Optional[Any],
     ):
-        if parser_inst is self._direct_parser:
-            return await self._direct_parser.parse_direct_url(url)
+        if isinstance(parser_inst, DirectMediaParser):
+            return await parser_inst.parse_direct_url(url)
         return await parser_inst.parse_with_redirect(url=url)
 
-    async def _materialize_audio(self, parse_result) -> Tuple[Path, List[Path]]:
+    def _get_processing_timeout(self) -> Optional[float]:
+        timeout = getattr(self.cfg, "processing_timeout", 120)
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = 120.0
+        return timeout if timeout > 0 else None
+
+    def _new_processing_deadline(self) -> Optional[float]:
+        timeout = self._get_processing_timeout()
+        if timeout is None:
+            return None
+        return time.monotonic() + timeout
+
+    def _remaining_processing_timeout(self, deadline: Optional[float]) -> Optional[float]:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return remaining
+
+    async def _wait_for_processing(self, awaitable, deadline: Optional[float]):
+        try:
+            timeout = self._remaining_processing_timeout(deadline)
+        except BaseException:
+            close = getattr(awaitable, "close", None)
+            if close:
+                close()
+            raise
+        if timeout is None:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    async def _transcribe_audio(self, audio_path: Path, deadline: Optional[float]):
+        bcut_timeout = self._remaining_processing_timeout(deadline)
+        transcriber = BcutTranscriber()
+        try:
+            return await asyncio.to_thread(
+                transcriber.transcript, str(audio_path), bcut_timeout
+            )
+        finally:
+            try:
+                transcriber.close()
+            except Exception as e:
+                logger.warning(f"关闭必剪转写会话失败: {e}")
+
+    async def _materialize_audio(
+        self, parse_result, deadline: Optional[float] = None
+    ) -> Tuple[Path, List[Path]]:
         """提取或转换第一份音频或视频素材得到 mp3 供 bcut 处理"""
         targets = []
         source_path = None
-
-        # 将所有已下载的解析结果媒体及封面加入待清理列表
-        for content in parse_result.contents:
-            try:
-                if hasattr(content, "get_path"):
-                    targets.append(await content.get_path())
-                if hasattr(content, "get_cover_path"):
-                    c_path = await content.get_cover_path()
-                    if c_path:
-                        targets.append(c_path)
-            except Exception:
-                pass
 
         source_path = None
         last_error = None
         for content_list in (parse_result.audio_contents, parse_result.video_contents):
             if content_list:
                 try:
-                    source_path = await content_list[0].get_path()
+                    source_path = await self._wait_for_processing(
+                        content_list[0].get_path(), deadline
+                    )
                     if source_path and source_path.exists():
                         last_error = None
                         break
+                except asyncio.TimeoutError:
+                    raise
                 except Exception as e:
                     last_error = e
                     continue
+
+        await self._cancel_unused_content_tasks(parse_result)
 
         if not source_path or not source_path.exists():
             if last_error is not None:
@@ -182,7 +296,7 @@ class VideoSummaryPlugin(Star):
             raise FileNotFoundError("未成功拉取到媒体文件实体")
         targets.append(source_path)
 
-        out_mp3 = self._temp_dir / f"{uuid.uuid4().hex}.mp3"
+        out_mp3 = source_path.parent / f"{uuid.uuid4().hex}.mp3"
         targets.append(out_mp3)
 
         # 使用 ffmpeg 提取归一化音频
@@ -203,33 +317,48 @@ class VideoSummaryPlugin(Star):
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
-        await proc.communicate()
+        try:
+            await self._wait_for_processing(proc.communicate(), deadline)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+            raise
 
-        if not out_mp3.exists():
+        if proc.returncode != 0 or not out_mp3.exists():
             raise RuntimeError("ffmpeg 转换音频失败。")
 
         return out_mp3, targets
 
     def _cleanup_temp_files(self, cleanup_targets: List[Path]):
-        # 彻底清理解析流程中产生的临时下载文件和 mp3
+        # 只清理本次流程明确产生/使用过的文件，避免并发任务互相删除素材。
+        seen: set[Path] = set()
         for target in cleanup_targets:
-            if target and target.exists():
-                try:
-                    if target.is_file():
-                        os.remove(target)
-                except Exception as e:
-                    logger.warning(f"未能删除临时文件 {target} : {e}")
+            if not target:
+                continue
+            try:
+                target = Path(target)
+                if target in seen:
+                    continue
+                seen.add(target)
+                if target.exists() and target.is_file():
+                    target.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"未能删除临时文件 {target} : {e}")
 
-        # 清理 parser 阶段残留的临时文件，保留 cookies 目录以便复用持久化凭据
-        try:
-            if self._temp_dir and self._temp_dir.exists():
-                for item in self._temp_dir.iterdir():
-                    if item.is_file():
-                        item.unlink(missing_ok=True)
-                    elif item.is_dir() and item.name != "cookies":
-                        shutil.rmtree(item, ignore_errors=True)
-        except Exception:
-            pass
+    @staticmethod
+    async def _cancel_unused_content_tasks(parse_result):
+        tasks = []
+        for content in getattr(parse_result, "contents", []):
+            for attr in ("path_task", "cover"):
+                task = getattr(content, attr, None)
+                if isinstance(task, asyncio.Task) and not task.done():
+                    task.cancel()
+                    tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _check_access(self, umo: str) -> bool:
         whitelist = getattr(self.cfg, "whitelist", None) or []
@@ -290,16 +419,45 @@ class VideoSummaryPlugin(Star):
             )
             return
 
-        (
-            parser_inst,
-            keyword,
-            searched,
-            used_direct_fallback,
-        ) = await self._resolve_url_with_direct_fallback(url)
-        if not parser_inst:
-            yield event.plain_result("❌ 未找到支持处理此链接的解析器")
-            return
+        runtime = self._create_processing_runtime()
+        try:
+            (
+                parser_inst,
+                keyword,
+                searched,
+                used_direct_fallback,
+            ) = await self._resolve_url_with_direct_fallback(
+                url,
+                parser_patterns=runtime["parser_patterns"],
+                direct_parser=runtime["direct_parser"],
+            )
+            if not parser_inst:
+                yield event.plain_result("❌ 未找到支持处理此链接的解析器")
+                return
 
+            async for result in self._summarize_resolved_video_impl(
+                event=event,
+                url=url,
+                parser_inst=parser_inst,
+                keyword=keyword,
+                searched=searched,
+                used_direct_fallback=used_direct_fallback,
+                force_refresh=force_refresh,
+            ):
+                yield result
+        finally:
+            await self._close_processing_runtime(runtime)
+
+    async def _summarize_resolved_video_impl(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        parser_inst: BaseParser,
+        keyword: Optional[str],
+        searched: Optional[Any],
+        used_direct_fallback: bool,
+        force_refresh: bool = False,
+    ):
         enable_cache = getattr(self.cfg, "enable_cache", True)
 
         url_hash = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
@@ -321,6 +479,7 @@ class VideoSummaryPlugin(Star):
             "⏳ 正在拉取素材与转写字幕（这可能需要一段较长的时间）..."
         )
 
+        deadline = self._new_processing_deadline()
         cleanup_targets = []
         transcript = None
         title = "未知视频"
@@ -346,11 +505,14 @@ class VideoSummaryPlugin(Star):
             if not transcript:
                 # 3. 借助 parser 项目解析与下载
                 try:
-                    parse_result = await self._parse_result_with_parser(
-                        parser_inst=parser_inst,
-                        url=url,
-                        keyword=keyword,
-                        searched=searched,
+                    parse_result = await self._wait_for_processing(
+                        self._parse_result_with_parser(
+                            parser_inst=parser_inst,
+                            url=url,
+                            keyword=keyword,
+                            searched=searched,
+                        ),
+                        deadline,
                     )
                 except Exception:
                     if used_direct_fallback:
@@ -363,13 +525,11 @@ class VideoSummaryPlugin(Star):
                     return
 
                 audio_path, cleanup_targets = await self._materialize_audio(
-                    parse_result
+                    parse_result, deadline=deadline
                 )
 
                 # 4. 交给 bcut 转写
-                transcript_res = await asyncio.to_thread(
-                    self.transcriber.transcript, str(audio_path)
-                )
+                transcript_res = await self._transcribe_audio(audio_path, deadline)
 
                 if not transcript_res or not transcript_res.segments:
                     yield event.plain_result("❌ 无法获取视频转写内容")
@@ -410,7 +570,11 @@ class VideoSummaryPlugin(Star):
             start_t = time.time()
             try:
                 result = await self._call_llm_for_summary(
-                    title, tags, segment_text, event
+                    title,
+                    tags,
+                    segment_text,
+                    event,
+                    timeout=self._remaining_processing_timeout(deadline),
                 )
             except FileNotFoundError as e:
                 logger.error(str(e))
@@ -454,6 +618,7 @@ class VideoSummaryPlugin(Star):
         tags: str,
         segment_text: str,
         event: AstrMessageEvent | None = None,
+        timeout: Optional[float] = None,
     ) -> str:
         """加载模板、调用 LLM 生成总结，返回纯文本结果。"""
         prompts_dir = Path(__file__).parent / "core" / "prompts"
@@ -498,11 +663,14 @@ class VideoSummaryPlugin(Star):
                 "未配置 LLM Provider。请在插件配置中设置 llm_provider 或在 AstrBot 全局设置中配置"
             )
 
-        timeout = getattr(self.cfg, "processing_timeout", 120)
+        chat_timeout = timeout if timeout is not None else self._get_processing_timeout()
         chat_coro = provider.text_chat(
             prompt=prompt, session_id=f"VideoSummary_{uuid.uuid4().hex}"
         )
-        response = await asyncio.wait_for(chat_coro, timeout=timeout)
+        if chat_timeout is None:
+            response = await chat_coro
+        else:
+            response = await asyncio.wait_for(chat_coro, timeout=chat_timeout)
 
         if hasattr(response, "completion_text"):
             result = response.completion_text
@@ -544,4 +712,17 @@ class VideoSummaryPlugin(Star):
 
     async def terminate(self):
         """插件卸载时触发"""
+        parser_instances = {id(parser): parser for _, _, parser in self._parser_patterns}
+        parser_instances[id(self._direct_parser)] = self._direct_parser
+        for parser in parser_instances.values():
+            close_session = getattr(parser, "close_session", None)
+            if close_session:
+                try:
+                    await close_session()
+                except Exception as e:
+                    logger.warning(f"关闭解析器会话失败: {e}")
+        try:
+            self.transcriber.close()
+        except Exception as e:
+            logger.warning(f"关闭必剪转写会话失败: {e}")
         await self.downloader.close()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 from dataclasses import field
 from pathlib import Path
@@ -34,33 +33,39 @@ def segments_to_text(segments: list[TranscriptSegment]) -> str:
 
 
 async def _extract_transcript(
-    plugin: "VideoSummaryPlugin", url: str
+    plugin: "VideoSummaryPlugin", url: str, deadline: float | None = None
 ) -> tuple[str, str, str]:
-    """解析 URL → 下载音频 → bcut 转写，返回 (title, tags, subtitle_text)。
-
-    异常直接向上抛出，由调用方转为错误信息。
-    """
+    """解析 URL → 下载音频 → bcut 转写，返回 (title, tags, subtitle_text)。"""
     if not isinstance(url, str) or not url.startswith("http"):
         raise ValueError("URL 无效，请提供 http/https 链接")
 
-    parser_inst, keyword, searched, used_direct_fallback = (
-        await plugin._resolve_url_with_direct_fallback(url)
-    )
-    if not parser_inst:
-        raise ValueError("未找到支持处理此链接的解析器")
-
-    enable_cache = getattr(plugin.cfg, "enable_cache", True)
-    url_hash = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
-    cache_dict = plugin._read_json_cache(url_hash)
-    cache_url_match = cache_dict.get("url") == url or ("url" not in cache_dict)
-
+    runtime = plugin._create_processing_runtime()
     cleanup_targets: list[Path] = []
-    transcript: dict | None = None
-    title = "未知视频"
-    tags = "通用视频"
+    used_direct_fallback = False
     direct_fallback_completed = False
 
     try:
+        parser_inst, keyword, searched, used_direct_fallback = (
+            await plugin._resolve_url_with_direct_fallback(
+                url,
+                parser_patterns=runtime["parser_patterns"],
+                direct_parser=runtime["direct_parser"],
+            )
+        )
+        if not parser_inst:
+            raise ValueError("未找到支持处理此链接的解析器")
+
+        enable_cache = getattr(plugin.cfg, "enable_cache", True)
+        url_hash = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
+        cache_dict = plugin._read_json_cache(url_hash)
+        cache_url_match = cache_dict.get("url") == url or ("url" not in cache_dict)
+
+        transcript: dict | None = None
+        title = "未知视频"
+        tags = "通用视频"
+        if deadline is None:
+            deadline = plugin._new_processing_deadline()
+
         if enable_cache and cache_url_match:
             cached_trs = cache_dict.get("transcript")
             if cached_trs:
@@ -73,11 +78,14 @@ async def _extract_transcript(
 
         if not transcript:
             try:
-                parse_result = await plugin._parse_result_with_parser(
-                    parser_inst=parser_inst,
-                    url=url,
-                    keyword=keyword,
-                    searched=searched,
+                parse_result = await plugin._wait_for_processing(
+                    plugin._parse_result_with_parser(
+                        parser_inst=parser_inst,
+                        url=url,
+                        keyword=keyword,
+                        searched=searched,
+                    ),
+                    deadline,
                 )
             except Exception:
                 if used_direct_fallback:
@@ -87,10 +95,10 @@ async def _extract_transcript(
             if not parse_result.video_contents and not parse_result.audio_contents:
                 raise ValueError("未解析到可供提取的音频/视频对象")
 
-            audio_path, cleanup_targets = await plugin._materialize_audio(parse_result)
-            transcript_res = await asyncio.to_thread(
-                plugin.transcriber.transcript, str(audio_path)
+            audio_path, cleanup_targets = await plugin._materialize_audio(
+                parse_result, deadline=deadline
             )
+            transcript_res = await plugin._transcribe_audio(audio_path, deadline)
 
             if not transcript_res or not transcript_res.segments:
                 raise ValueError("无法获取视频转写内容")
@@ -138,6 +146,7 @@ async def _extract_transcript(
         raise ValueError(f"字幕提取失败: {str(e)}") from e
     finally:
         plugin._cleanup_temp_files(cleanup_targets)
+        await plugin._close_processing_runtime(runtime)
 
 
 async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str, umo: str = "") -> str:
@@ -158,21 +167,32 @@ async def run_media_subtitle_tool(plugin: "VideoSummaryPlugin", url: str, umo: s
         return f"❌ {e}"
 
 
-async def run_media_summary_tool(plugin: "VideoSummaryPlugin", url: str, umo: str = "") -> str:
+async def run_media_summary_tool(
+    plugin: "VideoSummaryPlugin", url: str, umo: str = "", event: Any = None
+) -> str:
     """提取字幕并交由 AI 总结后返回精炼摘要。"""
     logger.info(f"LLM 工具 summary_extract_media_summary 被调用，URL: {url}")
     if not plugin._check_access(umo):
         return "❌ 当前会话无权使用媒体总结功能（不在白名单中或在黑名单中）"
     try:
-        title, tags, subtitle_text = await _extract_transcript(plugin, url)
-        summary = await plugin._call_llm_for_summary(title, tags, subtitle_text)
+        deadline = plugin._new_processing_deadline()
+        title, tags, subtitle_text = await _extract_transcript(
+            plugin, url, deadline=deadline
+        )
+        summary = await plugin._call_llm_for_summary(
+            title,
+            tags,
+            subtitle_text,
+            event=event,
+            timeout=plugin._remaining_processing_timeout(deadline),
+        )
         result_preview = summary[:70].replace("\n", " ")
         logger.info(
             f"LLM 工具 summary_extract_media_summary 成功: {title}，"
             f"共计 {len(summary)} 字符，预览: {result_preview}..."
         )
         return summary
-    except ValueError as e:
+    except (ValueError, RuntimeError, TimeoutError) as e:
         logger.warning(f"LLM 工具 summary_extract_media_summary 失败: {e}")
         return f"❌ {e}"
 
@@ -205,8 +225,9 @@ class MediaSummaryTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], url: str
     ) -> ToolExecResult:
-        umo = getattr(context.context.event, "unified_msg_origin", "")
-        return await run_media_summary_tool(self.plugin, url, umo)
+        event = getattr(context.context, "event", None)
+        umo = getattr(event, "unified_msg_origin", "")
+        return await run_media_summary_tool(self.plugin, url, umo, event=event)
 
 
 @dataclass
@@ -238,5 +259,6 @@ class MediaSubtitleTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], url: str
     ) -> ToolExecResult:
-        umo = getattr(context.context.event, "unified_msg_origin", "")
+        event = getattr(context.context, "event", None)
+        umo = getattr(event, "unified_msg_origin", "")
         return await run_media_subtitle_tool(self.plugin, url, umo)
