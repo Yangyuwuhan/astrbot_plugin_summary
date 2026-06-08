@@ -64,6 +64,7 @@ class VideoSummaryPlugin(Star):
             self._cache_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             logger.warning(f"无法创建临时/缓存目录: {e}")
+        self._migrate_cache_source_metadata()
 
         self._parser_patterns = self._build_parser_index()
 
@@ -185,6 +186,38 @@ class VideoSummaryPlugin(Star):
                 return {}
         return {}
 
+    def _migrate_cache_source_metadata(self):
+        for cache_file in self._cache_dir.glob("*.json"):
+            if cache_file.name.endswith(".tmp"):
+                continue
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    continue
+
+                changed = False
+                if "tags" in data:
+                    data.pop("tags", None)
+                    changed = True
+                if "source" not in data:
+                    data["source"] = "未知来源"
+                    changed = True
+                if not changed:
+                    continue
+
+                tmp_file = cache_file.with_name(
+                    f"{cache_file.name}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    with open(tmp_file, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=4)
+                    tmp_file.replace(cache_file)
+                finally:
+                    tmp_file.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"迁移总结缓存来源字段失败 {cache_file.name}: {e}")
+
     def _get_cache_lock(self, url_hash: str) -> asyncio.Lock:
         lock = self._cache_locks.get(url_hash)
         if lock is None:
@@ -208,6 +241,8 @@ class VideoSummaryPlugin(Star):
                 data.update(key)
             else:
                 data[key] = value
+            if (isinstance(key, dict) and "source" in key) or key == "source":
+                data.pop("tags", None)
 
             cache_file = self._get_json_cache_path(url_hash)
             tmp_file = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
@@ -266,7 +301,7 @@ class VideoSummaryPlugin(Star):
         segments = self._normalize_cache_segments(data.get("transcript"))
         summary = str(data.get("summary") or "")
         title = str(data.get("title") or "未命名缓存")
-        tags = str(data.get("tags") or "通用视频")
+        source = str(data.get("source") or "未知来源")
         url = str(data.get("url") or "")
         transcript_text = "\n".join(
             f"{seg['time']} - {seg['text']}" for seg in segments
@@ -275,7 +310,7 @@ class VideoSummaryPlugin(Star):
             "id": cache_id,
             "url": url,
             "title": title,
-            "tags": tags,
+            "source": source,
             "updated_at": self._format_cache_mtime(cache_file),
             "has_summary": bool(summary.strip()),
             "has_transcript": bool(segments),
@@ -309,7 +344,7 @@ class VideoSummaryPlugin(Star):
             item = self._cache_entry_payload(cache_file.stem, cache_file, data)
             haystack = " ".join(
                 str(item.get(key) or "")
-                for key in ("url", "title", "tags", "summary_preview", "transcript_preview")
+                for key in ("url", "title", "source", "summary_preview", "transcript_preview")
             ).lower()
             if query and query not in haystack:
                 continue
@@ -644,6 +679,7 @@ class VideoSummaryPlugin(Star):
         transcript = None
         title = "未知视频"
         tags = "通用视频"
+        source = "未知来源"
         direct_fallback_completed = False
         try:
             # 2. 命中字幕缓存时可跳过下载与转写
@@ -653,6 +689,7 @@ class VideoSummaryPlugin(Star):
                     transcript = {"segments": cached_trs}
                     title = str(cache_dict.get("title") or "缓存视频")
                     tags = str(cache_dict.get("tags") or "通用视频")
+                    source = str(cache_dict.get("source") or "未知来源")
                     if used_direct_fallback:
                         direct_fallback_completed = True
                     if force_refresh:
@@ -698,11 +735,16 @@ class VideoSummaryPlugin(Star):
                 if used_direct_fallback:
                     direct_fallback_completed = True
                 title = parse_result.title or "未知视频"
+                source = getattr(
+                    getattr(parser_inst, "platform", None),
+                    "display_name",
+                    "未知来源",
+                )
                 tags = "通用视频"
                 if parse_result.extra and "tags" in parse_result.extra:
                     tags = str(parse_result.extra["tags"])
 
-                # 开启缓存后，同时写入 url、字幕、标题、标签
+                # 开启缓存后，同时写入 url、字幕、标题、来源
                 if enable_cache:
                     await self._write_json_cache(
                         url_hash,
@@ -716,7 +758,7 @@ class VideoSummaryPlugin(Star):
                                 for seg in transcript["segments"]
                             ],
                             "title": title,
-                            "tags": tags,
+                            "source": source,
                         },
                         url=url,
                     )

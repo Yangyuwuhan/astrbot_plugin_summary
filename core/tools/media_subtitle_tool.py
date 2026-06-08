@@ -63,6 +63,7 @@ async def _extract_transcript(
         transcript: dict | None = None
         title = "未知视频"
         tags = "通用视频"
+        source = "未知来源"
         if deadline is None:
             deadline = plugin._new_processing_deadline()
 
@@ -73,6 +74,7 @@ async def _extract_transcript(
                 transcript = {"segments": cached_trs}
                 title = str(cache_dict.get("title") or "缓存视频")
                 tags = str(cache_dict.get("tags") or "通用视频")
+                source = str(cache_dict.get("source") or "未知来源")
                 if used_direct_fallback:
                     direct_fallback_completed = True
 
@@ -105,6 +107,11 @@ async def _extract_transcript(
 
             transcript = {"segments": transcript_res.segments}
             title = parse_result.title or "未知视频"
+            source = getattr(
+                getattr(parser_inst, "platform", None),
+                "display_name",
+                "未知来源",
+            )
             tags = "通用视频"
             if parse_result.extra and "tags" in parse_result.extra:
                 tags = str(parse_result.extra["tags"])
@@ -120,7 +127,7 @@ async def _extract_transcript(
                             for seg in transcript["segments"]
                         ],
                         "title": title,
-                        "tags": tags,
+                        "source": source,
                     },
                     url=url,
                 )

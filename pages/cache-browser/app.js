@@ -20,7 +20,7 @@ const nodes = {
   detailUrl: document.getElementById("detailUrl"),
   detailUpdated: document.getElementById("detailUpdated"),
   detailSegments: document.getElementById("detailSegments"),
-  detailTags: document.getElementById("detailTags"),
+  detailSource: document.getElementById("detailSource"),
   summaryTab: document.getElementById("summaryTab"),
   transcriptTab: document.getElementById("transcriptTab"),
   summaryView: document.getElementById("summaryView"),
@@ -95,7 +95,7 @@ function renderDetail() {
   nodes.detailUrl.href = detail.url || "#";
   nodes.detailUpdated.textContent = detail.updated_at || "未知";
   nodes.detailSegments.textContent = `${detail.segment_count || 0} 段`;
-  nodes.detailTags.textContent = detail.tags || "通用视频";
+  nodes.detailSource.textContent = detail.source || "未知来源";
   nodes.statusBadge.textContent = detail.has_summary ? "已总结" : "仅字幕";
 
   const summary = String(detail.summary || "").trim();
@@ -162,16 +162,65 @@ async function selectItem(id) {
   }
 }
 
+function copyTextFallback(value) {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+
+  const selection = document.getSelection();
+  const ranges = [];
+  if (selection) {
+    for (let i = 0; i < selection.rangeCount; i += 1) {
+      ranges.push(selection.getRangeAt(i));
+    }
+  }
+
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (error) {
+    console.error(error);
+  }
+
+  document.body.removeChild(textarea);
+  if (selection) {
+    selection.removeAllRanges();
+    ranges.forEach((range) => selection.addRange(range));
+  }
+
+  return copied;
+}
+
 async function copyText(text, emptyMessage) {
   const value = String(text || "").trim();
   if (!value) {
     showToast(emptyMessage);
     return;
   }
+
   try {
-    await navigator.clipboard.writeText(value);
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+    } else if (!copyTextFallback(value)) {
+      throw new Error("fallback copy failed");
+    }
     showToast("已复制");
   } catch (error) {
+    if (copyTextFallback(value)) {
+      showToast("已复制");
+      return;
+    }
     console.error(error);
     showToast("复制失败，请手动选择文本");
   }
