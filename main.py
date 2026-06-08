@@ -197,9 +197,6 @@ class VideoSummaryPlugin(Star):
                     continue
 
                 changed = False
-                if "tags" in data:
-                    data.pop("tags", None)
-                    changed = True
                 if "source" not in data:
                     data["source"] = "未知来源"
                     changed = True
@@ -241,8 +238,6 @@ class VideoSummaryPlugin(Star):
                 data.update(key)
             else:
                 data[key] = value
-            if (isinstance(key, dict) and "source" in key) or key == "source":
-                data.pop("tags", None)
 
             cache_file = self._get_json_cache_path(url_hash)
             tmp_file = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
@@ -758,6 +753,7 @@ class VideoSummaryPlugin(Star):
                                 for seg in transcript["segments"]
                             ],
                             "title": title,
+                            "tags": tags,
                             "source": source,
                         },
                         url=url,

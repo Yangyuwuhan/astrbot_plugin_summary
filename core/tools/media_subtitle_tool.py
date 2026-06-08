@@ -127,6 +127,7 @@ async def _extract_transcript(
                             for seg in transcript["segments"]
                         ],
                         "title": title,
+                        "tags": tags,
                         "source": source,
                     },
                     url=url,
