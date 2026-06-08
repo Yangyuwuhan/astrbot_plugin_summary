@@ -201,8 +201,6 @@ class CookieJar:
         ignored_items = []
 
         for header in set_cookie_headers:
-            logger.debug(f"解析 Set-Cookie: {header}")
-
             sc = SimpleCookie()
             sc.load(header)
 
@@ -254,17 +252,14 @@ class CookieJar:
                         )
                         continue
 
-                    old_value = existing.value
                     existing.value = value
                     existing.secure = secure
                     existing.expires = expires
 
-                    updated_items.append(
-                        (name, domain, path, old_value, value, secure, expires)
-                    )
+                    updated_items.append((name, domain, path, secure, expires))
                     logger.debug(
                         f"Cookie 更新: {name} (domain={domain}, path={path}) "
-                        f"old_value={old_value} new_value={value} secure={secure} expires={expires}"
+                        f"secure={secure} expires={expires}"
                     )
                 else:
                     self.cookies.append(
@@ -277,10 +272,10 @@ class CookieJar:
                             expires=expires,
                         )
                     )
-                    added_items.append((name, domain, path, value, secure, expires))
+                    added_items.append((name, domain, path, secure, expires))
                     logger.debug(
                         f"Cookie 新增: {name} (domain={domain}, path={path}) "
-                        f"value={value} secure={secure} expires={expires}"
+                        f"secure={secure} expires={expires}"
                     )
 
                 updated = True
@@ -293,4 +288,3 @@ class CookieJar:
                 f"(新增 {len(added_items)}，更新 {len(updated_items)}，忽略 {len(ignored_items)})"
             )
             logger.debug(f"当前 Cookie 总数: {len(self.cookies)}")
-            logger.debug(f"当前 cookies_str: {self.cookies_str}")

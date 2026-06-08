@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from copy import deepcopy
 from pathlib import Path
 import zoneinfo
@@ -16,57 +15,6 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_path
 
 
 _PLUGIN_NAME = "astrbot_plugin_summary"
-
-
-def _sync_summary_template_schema() -> None:
-    plugin_dir = Path(get_astrbot_plugin_path()) / _PLUGIN_NAME
-    prompts_dir = plugin_dir / "core" / "prompts"
-    schema_path = plugin_dir / "_conf_schema.json"
-
-    if not schema_path.exists() or not prompts_dir.exists():
-        return
-
-    templates = sorted(
-        p.name
-        for p in prompts_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == ".txt"
-    )
-    if not templates:
-        templates = ["default.txt"]
-
-    try:
-        with open(schema_path, "r", encoding="utf-8") as f:
-            schema = json.load(f)
-    except Exception as e:
-        logger.warning(f"读取 _conf_schema.json 失败，跳过模板下拉同步: {e}")
-        return
-
-    summary_field = schema.get("summary_template")
-    if not isinstance(summary_field, dict):
-        return
-
-    changed = False
-    if summary_field.get("type") != "string":
-        summary_field["type"] = "string"
-        changed = True
-    if summary_field.get("options") != templates:
-        summary_field["options"] = templates
-        changed = True
-    if summary_field.get("default") not in templates:
-        summary_field["default"] = templates[0]
-        changed = True
-
-    if not changed:
-        return
-
-    try:
-        with open(schema_path, "w", encoding="utf-8") as f:
-            json.dump(schema, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        logger.warning(f"写入 _conf_schema.json 失败，模板下拉同步未生效: {e}")
-
-
-_sync_summary_template_schema()
 
 
 DEFAULT_PARSERS_TEMPLATE: list[dict[str, Any]] = [
@@ -85,38 +33,13 @@ DEFAULT_PARSERS_TEMPLATE: list[dict[str, Any]] = [
         "cookies": "",
     },
     {
-        "__template_key": "kuaishou",
-        "enable": True,
-        "use_proxy": False,
-        "cookies": "",
-    },
-    {
-        "__template_key": "weibo",
-        "enable": True,
-        "use_proxy": False,
-        "cookies": "",
-    },
-    {
-        "__template_key": "xhs",
-        "enable": True,
-        "use_proxy": False,
-        "cookies": "",
-    },
-    {
-        "__template_key": "xiaoheihe",
-        "enable": True,
-        "use_proxy": False,
-        "cookies": "",
-        "show_body_text": True,
-        "video_send_mode": "first",
-    },
-    {
         "__template_key": "direct",
         "enable": True,
         "use_proxy": False,
         "cookies": "",
     },
 ]
+
 
 
 class ConfigNode:
@@ -360,18 +283,10 @@ class PluginConfig(ConfigNode):
         self.prompts_dir = self.plugin_dir / "core" / "prompts"
         self.prompts_dir.mkdir(parents=True, exist_ok=True)
 
-        # 同步可选模板到 _conf_schema.json，供 WebUI 下拉使用
-        self.sync_template_options_to_schema()
-
         # ---------- 模板设置 ----------
         # 模板目录（core/prompts）默认模板名
         if getattr(self, "summary_template", None) is None:
             self.summary_template = "default.txt"
-
-        available_templates = self.list_available_templates()
-        if available_templates and self.summary_template not in available_templates:
-            self.summary_template = available_templates[0]
-            self.save_config()
 
         # ---------- Parser ----------
         if not self.parsers_template:
@@ -379,54 +294,6 @@ class PluginConfig(ConfigNode):
             self.save_config()
 
         self.parser = ParserConfig(self.parsers_template)
-
-    def list_available_templates(self) -> list[str]:
-        if not self.prompts_dir.exists():
-            return []
-        templates = [
-            p.name
-            for p in self.prompts_dir.iterdir()
-            if p.is_file() and p.suffix.lower() == ".txt"
-        ]
-        return sorted(templates)
-
-    def sync_template_options_to_schema(self) -> None:
-        schema_path = self.plugin_dir / "_conf_schema.json"
-        if not schema_path.exists():
-            return
-
-        templates = self.list_available_templates()
-        if not templates:
-            templates = ["default.txt"]
-
-        try:
-            with open(schema_path, "r", encoding="utf-8") as f:
-                schema = json.load(f)
-        except Exception as e:
-            logger.warning(f"读取 _conf_schema.json 失败，跳过模板下拉同步: {e}")
-            return
-
-        summary_field = schema.get("summary_template")
-        if not isinstance(summary_field, dict):
-            return
-
-        old_options = summary_field.get("options")
-        old_default = summary_field.get("default")
-        summary_field["type"] = "string"
-        summary_field["options"] = templates
-        if old_default not in templates:
-            summary_field["default"] = templates[0]
-
-        if old_options == summary_field.get(
-            "options"
-        ) and old_default == summary_field.get("default"):
-            return
-
-        try:
-            with open(schema_path, "w", encoding="utf-8") as f:
-                json.dump(schema, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            logger.warning(f"写入 _conf_schema.json 失败，模板下拉同步未生效: {e}")
 
     def add_blacklist(self, umo: str):
         if umo not in self.blacklist:

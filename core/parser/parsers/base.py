@@ -2,7 +2,7 @@
 
 from abc import ABC
 from asyncio import Task, TimeoutError, sleep
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from re import Match, Pattern, compile
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
@@ -30,6 +30,7 @@ from ..exception import ParseException, RedirectException
 T = TypeVar("T", bound="BaseParser")
 HandlerFunc = Callable[[T, Match[str]], Coroutine[Any, Any, ParseResult]]
 KeyPatterns = list[tuple[str, Pattern[str]]]
+UrlValidator = Callable[[str], Awaitable[None]]
 
 _KEY_PATTERNS = "_key_patterns"
 
@@ -243,6 +244,7 @@ class BaseParser:
         cover_url: str | None = None,
         duration: float = 0.0,
         headers: dict[str, str] | None = None,
+        url_validator: UrlValidator | None = None,
     ):
         """创建视频内容"""
         cover_task = None
@@ -252,7 +254,10 @@ class BaseParser:
             )
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_video(
-                url_or_task, headers=headers or self.headers, proxy=self.proxy
+                url_or_task,
+                headers=headers or self.headers,
+                proxy=self.proxy,
+                url_validator=url_validator,
             )
 
         return VideoContent(url_or_task, cover_task, duration)
@@ -305,11 +310,15 @@ class BaseParser:
         url_or_task: str | Task[Path],
         duration: float = 0.0,
         headers: dict[str, str] | None = None,
+        url_validator: UrlValidator | None = None,
     ):
         """创建音频内容"""
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_audio(
-                url_or_task, headers=headers or self.headers, proxy=self.proxy
+                url_or_task,
+                headers=headers or self.headers,
+                proxy=self.proxy,
+                url_validator=url_validator,
             )
 
         return AudioContent(url_or_task, duration)

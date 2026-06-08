@@ -7,6 +7,7 @@ import asyncio
 import uuid
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Any
 
@@ -15,6 +16,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 from astrbot.api.message_components import Reply, Plain
+from quart import jsonify, request
 
 # 引用 bcut 和模型
 from .core.transcriber.bcut import BcutTranscriber
@@ -28,8 +30,12 @@ from .core.parser.parsers.direct import DirectMediaParser
 from .core.tools.media_subtitle_tool import (
     MediaSummaryTool,
     MediaSubtitleTool,
+    format_time,
     segments_to_text,
 )
+
+
+PLUGIN_NAME = "astrbot_plugin_summary"
 
 
 class _ProcessingConfigProxy:
@@ -48,6 +54,7 @@ class VideoSummaryPlugin(Star):
         self.downloader = Downloader(self.cfg)
         self.transcriber = BcutTranscriber()
         self._direct_parser = DirectMediaParser(self.cfg, self.downloader)
+        self._cache_locks: dict[str, asyncio.Lock] = {}
 
         # 确保 temp_dir 与 cache_dir 为 Path 且存在
         self._temp_dir = Path(getattr(self.cfg, "temp_dir", Path.cwd() / "tmp"))
@@ -67,6 +74,19 @@ class VideoSummaryPlugin(Star):
             tools.append(MediaSubtitleTool(plugin=self))
         if tools:
             self.context.add_llm_tools(*tools)
+
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cache/list",
+            self.page_cache_list,
+            ["GET"],
+            "Summary cache list",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cache/detail",
+            self.page_cache_detail,
+            ["GET"],
+            "Summary cache detail",
+        )
 
     def _is_parser_enabled(self, platform_name: str) -> bool:
         parser_nodes = getattr(getattr(self.cfg, "parser", None), "_nodes", {})
@@ -165,15 +185,150 @@ class VideoSummaryPlugin(Star):
                 return {}
         return {}
 
-    def _write_json_cache(
-        self, url_hash: str, key: str, value: Any, url: Optional[str] = None
+    def _get_cache_lock(self, url_hash: str) -> asyncio.Lock:
+        lock = self._cache_locks.get(url_hash)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cache_locks[url_hash] = lock
+        return lock
+
+    async def _write_json_cache(
+        self,
+        url_hash: str,
+        key: str | dict[str, Any],
+        value: Any = None,
+        url: Optional[str] = None,
     ):
-        data = self._read_json_cache(url_hash)
-        if url:
-            data["url"] = url
-        data[key] = value
-        with open(self._get_json_cache_path(url_hash), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        lock = self._get_cache_lock(url_hash)
+        async with lock:
+            data = self._read_json_cache(url_hash)
+            if url:
+                data["url"] = url
+            if isinstance(key, dict):
+                data.update(key)
+            else:
+                data[key] = value
+
+            cache_file = self._get_json_cache_path(url_hash)
+            tmp_file = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                tmp_file.replace(cache_file)
+            finally:
+                tmp_file.unlink(missing_ok=True)
+
+    def _format_cache_mtime(self, cache_file: Path) -> str:
+        try:
+            modified = datetime.fromtimestamp(
+                cache_file.stat().st_mtime, tz=self.cfg.timezone
+            )
+            return modified.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
+    def _normalize_cache_segments(self, segments: Any) -> list[dict[str, Any]]:
+        if not isinstance(segments, list):
+            return []
+        normalized = []
+        for seg in segments:
+            if isinstance(seg, dict):
+                start = seg.get("start", 0)
+                end = seg.get("end", 0)
+                text = str(seg.get("text") or "").strip()
+            else:
+                start = getattr(seg, "start", 0)
+                end = getattr(seg, "end", 0)
+                text = str(getattr(seg, "text", "") or "").strip()
+            try:
+                start_value = float(start or 0)
+            except (TypeError, ValueError):
+                start_value = 0.0
+            try:
+                end_value = float(end or 0)
+            except (TypeError, ValueError):
+                end_value = 0.0
+            if not text:
+                continue
+            normalized.append(
+                {
+                    "start": start_value,
+                    "end": end_value,
+                    "time": format_time(start_value),
+                    "text": text,
+                }
+            )
+        return normalized
+
+    def _cache_entry_payload(
+        self, cache_id: str, cache_file: Path, data: dict, include_detail: bool = False
+    ) -> dict[str, Any]:
+        segments = self._normalize_cache_segments(data.get("transcript"))
+        summary = str(data.get("summary") or "")
+        title = str(data.get("title") or "未命名缓存")
+        tags = str(data.get("tags") or "通用视频")
+        url = str(data.get("url") or "")
+        transcript_text = "\n".join(
+            f"{seg['time']} - {seg['text']}" for seg in segments
+        )
+        payload = {
+            "id": cache_id,
+            "url": url,
+            "title": title,
+            "tags": tags,
+            "updated_at": self._format_cache_mtime(cache_file),
+            "has_summary": bool(summary.strip()),
+            "has_transcript": bool(segments),
+            "segment_count": len(segments),
+            "summary_preview": summary[:180],
+            "transcript_preview": transcript_text[:220],
+        }
+        if include_detail:
+            payload.update(
+                {
+                    "summary": summary,
+                    "transcript": segments,
+                    "transcript_text": transcript_text,
+                }
+            )
+        return payload
+
+    async def page_cache_list(self):
+        query = str(request.args.get("q") or "").strip().lower()
+        items = []
+        for cache_file in sorted(
+            self._cache_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        ):
+            if cache_file.name.endswith(".tmp"):
+                continue
+            data = self._read_json_cache(cache_file.stem)
+            if not data:
+                continue
+            item = self._cache_entry_payload(cache_file.stem, cache_file, data)
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in ("url", "title", "tags", "summary_preview", "transcript_preview")
+            ).lower()
+            if query and query not in haystack:
+                continue
+            items.append(item)
+            if len(items) >= 50:
+                break
+        return jsonify({"items": items, "total": len(items), "limit": 50})
+
+    async def page_cache_detail(self):
+        cache_id = str(request.args.get("id") or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", cache_id):
+            return jsonify({"error": "invalid cache id"}), 400
+        cache_file = self._get_json_cache_path(cache_id)
+        if not cache_file.exists():
+            return jsonify({"error": "cache not found"}), 404
+        data = self._read_json_cache(cache_id)
+        if not data:
+            return jsonify({"error": "cache is empty or unreadable"}), 404
+        return jsonify(self._cache_entry_payload(cache_id, cache_file, data, True))
 
     async def _resolve_url(
         self, url: str, parser_patterns: Optional[list] = None
@@ -215,6 +370,11 @@ class VideoSummaryPlugin(Star):
     ):
         if isinstance(parser_inst, DirectMediaParser):
             return await parser_inst.parse_direct_url(url)
+        if keyword is not None and searched is not None:
+            try:
+                return await parser_inst.parse(keyword, searched)
+            except Exception as e:
+                logger.warning(f"原始链接解析失败，尝试重定向解析: {e}")
         return await parser_inst.parse_with_redirect(url=url)
 
     def _get_processing_timeout(self) -> Optional[float]:
@@ -544,17 +704,22 @@ class VideoSummaryPlugin(Star):
 
                 # 开启缓存后，同时写入 url、字幕、标题、标签
                 if enable_cache:
-                    self._write_json_cache(
+                    await self._write_json_cache(
                         url_hash,
-                        "transcript",
-                        [
-                            {"start": seg.start, "end": seg.end, "text": seg.text}
-                            for seg in transcript["segments"]
-                        ],
+                        {
+                            "transcript": [
+                                {
+                                    "start": seg.start,
+                                    "end": seg.end,
+                                    "text": seg.text,
+                                }
+                                for seg in transcript["segments"]
+                            ],
+                            "title": title,
+                            "tags": tags,
+                        },
                         url=url,
                     )
-                    self._write_json_cache(url_hash, "title", title)
-                    self._write_json_cache(url_hash, "tags", tags)
 
                 yield event.plain_result("⏳ 素材转写完成，正在交由 AI 思考...")
 
@@ -569,7 +734,7 @@ class VideoSummaryPlugin(Star):
 
             start_t = time.time()
             try:
-                result = await self._call_llm_for_summary(
+                result, token_usage = await self._call_llm_for_summary(
                     title,
                     tags,
                     segment_text,
@@ -592,9 +757,9 @@ class VideoSummaryPlugin(Star):
 
             # 保存总结缓存
             if enable_cache:
-                self._write_json_cache(url_hash, "summary", result, url=url)
+                await self._write_json_cache(url_hash, "summary", result, url=url)
             if getattr(self.cfg, "show_token_usage", False):
-                result += f"\n━━━━━━━━━━━━━━\n耗时: {ai_cost_time:.2f} s"
+                result += self._format_token_usage(token_usage, ai_cost_time)
 
             yield event.plain_result(f"📌 视频总结\n\n{result}")
 
@@ -619,8 +784,8 @@ class VideoSummaryPlugin(Star):
         segment_text: str,
         event: AstrMessageEvent | None = None,
         timeout: Optional[float] = None,
-    ) -> str:
-        """加载模板、调用 LLM 生成总结，返回纯文本结果。"""
+    ) -> tuple[str, Optional[dict[str, int]]]:
+        """加载模板、调用 LLM 生成总结，返回纯文本结果和 token 用量。"""
         prompts_dir = Path(__file__).parent / "core" / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
         template_name = (
@@ -679,7 +844,74 @@ class VideoSummaryPlugin(Star):
         else:
             result = str(response)
 
-        return self._remove_markdown(result)
+        return self._remove_markdown(result), self._extract_token_usage(response)
+
+    def _extract_token_usage(self, response: Any) -> Optional[dict[str, int]]:
+        raw_completion = getattr(response, "raw_completion", None)
+        usage = None
+        if raw_completion is not None:
+            usage = getattr(raw_completion, "usage", None)
+            if usage is None and isinstance(raw_completion, dict):
+                usage = raw_completion.get("usage")
+        if usage is None:
+            usage = getattr(response, "usage", None)
+            if usage is None and isinstance(response, dict):
+                usage = response.get("usage")
+        if usage is None:
+            return None
+
+        def _read_int(*names: str) -> Optional[int]:
+            for name in names:
+                value = None
+                if isinstance(usage, dict):
+                    value = usage.get(name)
+                else:
+                    value = getattr(usage, name, None)
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        input_tokens = _read_int("prompt_tokens", "input_tokens")
+        output_tokens = _read_int("completion_tokens", "output_tokens")
+        total_tokens = _read_int("total_tokens")
+        if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        if input_tokens is None and output_tokens is None and total_tokens is None:
+            return None
+        result = {}
+        if input_tokens is not None:
+            result["input"] = input_tokens
+        if output_tokens is not None:
+            result["output"] = output_tokens
+        if total_tokens is not None:
+            result["total"] = total_tokens
+        return result
+
+    def _format_token_usage(
+        self, token_usage: Optional[dict[str, int]], cost_time: float
+    ) -> str:
+        if not token_usage:
+            return (
+                f"\n━━━━━━━━━━━━━━\n"
+                f"输入: 未返回\n输出: 未返回\n总计: 未返回\n耗时: {cost_time:.2f} s"
+            )
+        def _format_count(value: int | None) -> str:
+            return f"{value} tokens" if value is not None else "未返回"
+
+        input_tokens = token_usage.get("input")
+        output_tokens = token_usage.get("output")
+        total_tokens = token_usage.get("total")
+        return (
+            f"\n━━━━━━━━━━━━━━\n"
+            f"输入: {_format_count(input_tokens)}\n"
+            f"输出: {_format_count(output_tokens)}\n"
+            f"总计: {_format_count(total_tokens)}\n"
+            f"耗时: {cost_time:.2f} s"
+        )
 
     def _remove_markdown(self, text: str) -> str:
         """

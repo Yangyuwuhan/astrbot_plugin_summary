@@ -1,9 +1,10 @@
 from asyncio import Task, TimeoutError, create_task, gather, sleep, to_thread
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from functools import wraps
 from pathlib import Path
 from time import monotonic
 from typing import Any, ParamSpec, TypeVar
+from urllib.parse import urljoin
 
 import aiofiles
 import yt_dlp
@@ -26,6 +27,7 @@ from .utils import LimitedSizeDict, generate_file_name, merge_av, safe_unlink
 
 P = ParamSpec("P")
 T = TypeVar("T")
+UrlValidator = Callable[[str], Awaitable[None]]
 
 
 def auto_task(func: Callable[P, Coroutine[Any, Any, T]]) -> Callable[P, Task[T]]:
@@ -89,6 +91,7 @@ class Downloader:
         file_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
+        url_validator: UrlValidator | None = None,
     ) -> Path:
         """流式下载"""
         if not file_name:
@@ -100,67 +103,84 @@ class Downloader:
         headers = headers or self.default_headers
         retries = self.cfg.download_retry_times
         for attempt in range(retries + 1):
+            current_url = url
+            redirects = 0
             try:
-                async with self.client.get(
-                    url, headers=headers, allow_redirects=True, proxy=proxy
-                ) as response:
-                    if response.status >= 400:
-                        raise ClientError(f"HTTP {response.status} {response.reason}")
-                    content_length = response.content_length
-                    max_bytes = self.max_size * 1024 * 1024
+                while True:
+                    if url_validator:
+                        await url_validator(current_url)
+                    async with self.client.get(
+                        current_url,
+                        headers=headers,
+                        allow_redirects=url_validator is None,
+                        proxy=proxy,
+                    ) as response:
+                        if url_validator and response.status in (301, 302, 303, 307, 308):
+                            location = response.headers.get("Location")
+                            if not location:
+                                raise ClientError("HTTP redirect without Location")
+                            redirects += 1
+                            if redirects > 5:
+                                raise ClientError("HTTP redirect limit exceeded")
+                            current_url = urljoin(current_url, location)
+                            continue
 
-                    if content_length == 0:
-                        logger.warning(f"媒体 url: {url}, 大小为 0, 取消下载")
-                        raise ZeroSizeException
-                    if content_length and content_length > max_bytes:
-                        logger.warning(
-                            f"媒体 url: {url} 大小 {content_length / 1024 / 1024:.2f} MB 超过 {self.max_size} MB, 取消下载"
+                        if response.status >= 400:
+                            raise ClientError(f"HTTP {response.status} {response.reason}")
+                        content_length = response.content_length
+                        max_bytes = self.max_size * 1024 * 1024
+
+                        if content_length == 0:
+                            logger.warning(f"媒体 url: {url}, 大小为 0, 取消下载")
+                            raise ZeroSizeException
+                        if content_length and content_length > max_bytes:
+                            logger.warning(
+                                f"媒体 url: {url} 大小 {content_length / 1024 / 1024:.2f} MB 超过 {self.max_size} MB, 取消下载"
+                            )
+                            raise SizeLimitException
+
+                        downloaded = 0
+                        next_log_percent = 10
+                        last_log_time = monotonic()
+                        total_desc = (
+                            f"{content_length / 1024 / 1024:.2f} MB"
+                            if content_length
+                            else "未知大小"
                         )
-                        raise SizeLimitException
+                        logger.info(f"开始下载媒体: {file_name}, 大小: {total_desc}")
 
-                    downloaded = 0
-                    next_log_percent = 10
-                    last_log_time = monotonic()
-                    total_desc = (
-                        f"{content_length / 1024 / 1024:.2f} MB"
-                        if content_length
-                        else "未知大小"
-                    )
-                    logger.info(f"开始下载媒体: {file_name}, 大小: {total_desc}")
+                        async with aiofiles.open(file_path, "wb") as file:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                downloaded += len(chunk)
+                                if downloaded > max_bytes:
+                                    raise SizeLimitException
+                                await file.write(chunk)
 
-                    async with aiofiles.open(file_path, "wb") as file:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            downloaded += len(chunk)
-                            if downloaded > max_bytes:
-                                raise SizeLimitException
-                            await file.write(chunk)
-
-                            if content_length:
-                                percent = int(downloaded * 100 / content_length)
-                                if percent >= next_log_percent:
+                                if content_length:
+                                    percent = int(downloaded * 100 / content_length)
+                                    if percent >= next_log_percent:
+                                        logger.info(
+                                            f"下载进度: {file_name} {min(percent, 100)}% "
+                                            f"({downloaded / 1024 / 1024:.2f}/{content_length / 1024 / 1024:.2f} MB)"
+                                        )
+                                        next_log_percent += 10
+                                elif monotonic() - last_log_time >= 5:
                                     logger.info(
-                                        f"下载进度: {file_name} {min(percent, 100)}% "
-                                        f"({downloaded / 1024 / 1024:.2f}/{content_length / 1024 / 1024:.2f} MB)"
+                                        f"下载进度: {file_name} 已下载 {downloaded / 1024 / 1024:.2f} MB"
                                     )
-                                    next_log_percent += 10
-                            elif monotonic() - last_log_time >= 5:
-                                logger.info(
-                                    f"下载进度: {file_name} 已下载 {downloaded / 1024 / 1024:.2f} MB"
-                                )
-                                last_log_time = monotonic()
+                                    last_log_time = monotonic()
 
-                    if downloaded == 0:
-                        logger.warning(f"媒体 url: {url}, 实际大小为 0, 取消下载")
-                        raise ZeroSizeException
-                    if content_length and downloaded < content_length:
-                        raise ClientError(
-                            f"HTTP payload incomplete {downloaded}/{content_length}"
+                        if downloaded == 0:
+                            logger.warning(f"媒体 url: {url}, 实际大小为 0, 取消下载")
+                            raise ZeroSizeException
+                        if content_length and downloaded < content_length:
+                            raise ClientError(
+                                f"HTTP payload incomplete {downloaded}/{content_length}"
+                            )
+                        logger.info(
+                            f"下载完成: {file_name}, 实际大小: {downloaded / 1024 / 1024:.2f} MB"
                         )
-                    logger.info(
-                        f"下载完成: {file_name}, 实际大小: {downloaded / 1024 / 1024:.2f} MB"
-                    )
-
-                return file_path
+                        return file_path
             except (ZeroSizeException, SizeLimitException):
                 await safe_unlink(file_path)
                 raise
@@ -202,11 +222,16 @@ class Downloader:
         video_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        url_validator: UrlValidator | None = None,
     ) -> Path:
         if video_name is None:
             video_name = generate_file_name(url, ".mp4")
         return await self.streamd(
-            url, file_name=video_name, headers=headers, proxy=proxy
+            url,
+            file_name=video_name,
+            headers=headers,
+            proxy=proxy,
+            url_validator=url_validator,
         )
 
     @auto_task
@@ -217,11 +242,16 @@ class Downloader:
         audio_name: str | None = None,
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        url_validator: UrlValidator | None = None,
     ) -> Path:
         if audio_name is None:
             audio_name = generate_file_name(url, ".mp3")
         return await self.streamd(
-            url, file_name=audio_name, headers=headers, proxy=proxy
+            url,
+            file_name=audio_name,
+            headers=headers,
+            proxy=proxy,
+            url_validator=url_validator,
         )
 
     @auto_task

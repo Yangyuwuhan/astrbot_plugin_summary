@@ -31,14 +31,14 @@
 - `show_token_usage`：是否在结尾输出 token 使用情况与总结耗时
 - `enable_cache`：是否启用本地缓存
 - `processing_timeout`：LLM 总结超时秒数
-- `summary_template`：总结模板选择（WebUI 下拉显示 `core/prompts/` 下的 txt 文件）
+- `summary_template`：总结模板选择，仅支持内置 `default.txt` 和 `concise.txt`
 - `whitelist` / `blacklist`：白名单/黑名单
 - `source_max_size` / `source_max_minute`：下载资源大小与时长限制
 - `download_timeout` / `download_retry_times` / `common_timeout`：下载与请求超时控制
 - `proxy`：全局代理地址
 - `enable_media_summary_tool`：是否向 LLM 注册媒体总结工具
 - `enable_media_subtitle_tool`：是否向 LLM 注册字幕提取工具
-- `parsers_template`：各平台解析器开关与参数，具体请参考[astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
+- `parsers_template`：各平台解析器开关与参数，默认启用 B站、抖音、直链媒体，具体请参考[astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
 
 ## LLM 工具
 
@@ -70,9 +70,8 @@
 
 ## 注意
 
-- 环境中需存在 `ffmpeg`
 - 支持的 URL 请参考 [astrbot_plugin_parser](https://github.com/Zhalslar/astrbot_plugin_parser) 
-- 可在`data/plugins/astrbot_plugin_summary/core/prompts/`中添加`.txt`文件来自定义输出模板。注意重载插件以加载新模板。
+- 提示词模板位于 `data/plugins/astrbot_plugin_summary/core/prompts/`，可直接修改已有模板文件来自定义输出效果；插件更新时模板会恢复为仓库原模板。
 - 本插件的工作依赖于音频转文字，并非直接浏览视频
 - 本插件采用 **vibe coding**，作者已对其功能进行严格审查，但不保证插件稳定性
 

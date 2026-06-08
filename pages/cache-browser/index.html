@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>总结缓存</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar" aria-label="缓存列表">
+        <header class="topbar">
+          <div>
+            <h1>总结缓存</h1>
+            <p id="cacheCount">0 条记录</p>
+          </div>
+          <button id="refreshButton" class="icon-button" type="button" title="刷新" aria-label="刷新">↻</button>
+        </header>
+        <label class="search-wrap" for="searchInput">
+          <span>⌕</span>
+          <input id="searchInput" type="search" placeholder="搜索 URL、标题、标签或内容" autocomplete="off" />
+        </label>
+        <div id="list" class="cache-list" role="list"></div>
+      </aside>
+
+      <section class="detail" aria-label="缓存详情">
+        <div id="emptyState" class="empty-state">
+          <h2>选择一条缓存</h2>
+          <p>缓存的 URL、字幕和总结会显示在这里。</p>
+        </div>
+
+        <article id="detailPanel" class="detail-panel" hidden>
+          <header class="detail-header">
+            <div class="title-block">
+              <span id="statusBadge" class="badge">缓存</span>
+              <h2 id="detailTitle"></h2>
+              <a id="detailUrl" class="url-link" href="#" target="_blank" rel="noreferrer"></a>
+            </div>
+            <div class="actions">
+              <button id="copySummary" type="button">复制总结</button>
+              <button id="copyTranscript" type="button">复制字幕</button>
+            </div>
+          </header>
+
+          <dl class="meta-grid">
+            <div>
+              <dt>更新时间</dt>
+              <dd id="detailUpdated"></dd>
+            </div>
+            <div>
+              <dt>字幕段落</dt>
+              <dd id="detailSegments"></dd>
+            </div>
+            <div>
+              <dt>标签</dt>
+              <dd id="detailTags"></dd>
+            </div>
+          </dl>
+
+          <nav class="tabs" aria-label="详情视图">
+            <button id="summaryTab" class="tab active" type="button">总结</button>
+            <button id="transcriptTab" class="tab" type="button">字幕</button>
+          </nav>
+
+          <section id="summaryView" class="content-view prose"></section>
+          <section id="transcriptView" class="content-view transcript" hidden></section>
+        </article>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

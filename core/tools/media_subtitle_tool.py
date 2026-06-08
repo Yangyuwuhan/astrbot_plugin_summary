@@ -112,17 +112,18 @@ async def _extract_transcript(
                 direct_fallback_completed = True
 
             if enable_cache:
-                plugin._write_json_cache(
+                await plugin._write_json_cache(
                     url_hash,
-                    "transcript",
-                    [
-                        {"start": seg.start, "end": seg.end, "text": seg.text}
-                        for seg in transcript["segments"]
-                    ],
+                    {
+                        "transcript": [
+                            {"start": seg.start, "end": seg.end, "text": seg.text}
+                            for seg in transcript["segments"]
+                        ],
+                        "title": title,
+                        "tags": tags,
+                    },
                     url=url,
                 )
-                plugin._write_json_cache(url_hash, "title", title)
-                plugin._write_json_cache(url_hash, "tags", tags)
 
         segment_list: list[TranscriptSegment] = []
         for seg in transcript["segments"]:
@@ -179,7 +180,7 @@ async def run_media_summary_tool(
         title, tags, subtitle_text = await _extract_transcript(
             plugin, url, deadline=deadline
         )
-        summary = await plugin._call_llm_for_summary(
+        summary, _token_usage = await plugin._call_llm_for_summary(
             title,
             tags,
             subtitle_text,

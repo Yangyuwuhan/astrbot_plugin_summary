@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "cache-browser": {
+      "title": "总结缓存",
+      "description": "预览已缓存 URL 的字幕与 AI 总结。"
+    }
+  }
+}
