@@ -194,6 +194,9 @@ async def run_media_summary_tool(
             event=event,
             timeout=plugin._remaining_processing_timeout(deadline),
         )
+        if getattr(plugin.cfg, "enable_cache", True):
+            url_hash = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
+            await plugin._write_json_cache(url_hash, "summary", summary, url=url)
         result_preview = summary[:70].replace("\n", " ")
         logger.info(
             f"LLM 工具 summary_extract_media_summary 成功: {title}，"
